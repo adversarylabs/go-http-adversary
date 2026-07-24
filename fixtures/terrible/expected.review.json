@@ -1,0 +1,1 @@
+{"risk":"high","findings":[{"ruleId":"go-http.body-limit","severity":"high","evidenceCount":1},{"ruleId":"go-http.server-timeouts","severity":"high","evidenceCount":1},{"ruleId":"go-http.graceful-shutdown","severity":"medium","evidenceCount":1}],"positiveKeys":[],"ship":false}
