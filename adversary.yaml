@@ -1,0 +1,31 @@
+name: go-http
+version: 0.0.1
+description: Reviews Go HTTP services for bounded requests, safe middleware, and production-ready server lifecycle.
+
+triggers:
+  manual: true
+  files_changed:
+    - "**/*.go"
+
+detection:
+  files:
+    - "**/*.go"
+
+runtime:
+  name: node
+  version: "22"
+  command:
+    - dist/index.js
+
+permissions:
+  enforcement: advisory
+  filesystem:
+    read:
+      - .
+    write: []
+  network: false
+  environment:
+    allow: []
+
+findings:
+  format: adversary.review.v1

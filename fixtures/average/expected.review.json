@@ -1,0 +1,1 @@
+{"risk":"medium","findings":[{"ruleId":"go-http.graceful-shutdown","severity":"medium","evidenceCount":1}],"positiveKeys":[],"ship":false}
