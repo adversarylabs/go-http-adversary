@@ -11,7 +11,7 @@ import { reviewDomain } from "./review.js";
 export function createApp(): Adversary {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.1",
+    version: "0.0.2",
     review: { maximumFindings: 5, minimumConfidence: "medium" },
   });
 
@@ -19,14 +19,27 @@ export function createApp(): Adversary {
     const discovery = await discoverSources(ctx.repoPath);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
-    ctx.review.observe({
-      key: domain.observationKey,
-      summary: analysis.mode === "diff"
-        ? `Prepared ${analysis.filesScanned} changed ${domain.sourceDescription} files against ${analysis.base}.`
-        : `Prepared ${analysis.filesScanned} ${domain.sourceDescription} files in repository review mode.`,
-      metadata: { parser: "tree-sitter-go", mode: analysis.mode, parseErrors: analysis.parseErrors },
-    });
-    reviewDomain(ctx, analysis);
+    if (analysis.parseErrors.length > 0) {
+      ctx.review.observe({
+        key: domain.observationKey,
+        summary: `Parsed ${analysis.filesScanned} ${domain.sourceDescription} files with ${analysis.parseErrors.length} parse error${analysis.parseErrors.length === 1 ? "" : "s"}.`,
+        metadata: {
+          role: "context",
+          parser: "tree-sitter-go",
+          mode: analysis.mode,
+          parseErrors: analysis.parseErrors.length,
+        },
+      });
+    }
+    await reviewDomain(
+      ctx,
+      analysis,
+      discovery.files.map((file) => ({
+        path: file.path,
+        current: file.current,
+        status: file.status,
+      })),
+    );
   });
   return app;
 }

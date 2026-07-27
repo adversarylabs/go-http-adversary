@@ -7090,7 +7090,7 @@ var require__ = __commonJS({
     var discriminator_1 = require_discriminator();
     var json_schema_2020_12_1 = require_json_schema_2020_12();
     var META_SCHEMA_ID = "https://json-schema.org/draft/2020-12/schema";
-    var Ajv20202 = class extends core_1.default {
+    var Ajv20203 = class extends core_1.default {
       constructor(opts = {}) {
         super({
           ...opts,
@@ -7117,11 +7117,11 @@ var require__ = __commonJS({
         return this.opts.defaultMeta = super.defaultMeta() || (this.getSchema(META_SCHEMA_ID) ? META_SCHEMA_ID : void 0);
       }
     };
-    exports.Ajv2020 = Ajv20202;
-    module2.exports = exports = Ajv20202;
-    module2.exports.Ajv2020 = Ajv20202;
+    exports.Ajv2020 = Ajv20203;
+    module2.exports = exports = Ajv20203;
+    module2.exports.Ajv2020 = Ajv20203;
     Object.defineProperty(exports, "__esModule", { value: true });
-    exports.default = Ajv20202;
+    exports.default = Ajv20203;
     var validate_1 = require_validate();
     Object.defineProperty(exports, "KeywordCxt", { enumerable: true, get: function() {
       return validate_1.KeywordCxt;
@@ -14488,9 +14488,298 @@ import { realpath } from "node:fs/promises";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // node_modules/@adversarylabs/sdk/dist/index.js
-var import__ = __toESM(require__(), 1);
+var import__2 = __toESM(require__(), 1);
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+
+// node_modules/@adversarylabs/sdk/dist/model.js
+var import__ = __toESM(require__(), 1);
+var ADVERSARY_MODEL_PROTOCOL_VERSION = 1;
+var ADVERSARY_MODEL_ENDPOINT_ENV = "ADVERSARY_MODEL_ENDPOINT";
+var ADVERSARY_MODEL_TOKEN_ENV = "ADVERSARY_MODEL_TOKEN";
+var DEFAULT_MODEL_TIMEOUT_MS = 12e4;
+var MAX_MODEL_TIMEOUT_MS = 6e5;
+var DEFAULT_MAXIMUM_OUTPUT_TOKENS = 8192;
+var MAX_MAXIMUM_OUTPUT_TOKENS = 65536;
+var MAX_PROMPT_BYTES = 256 << 10;
+var MAX_INPUT_BYTES = 4 << 20;
+var MAX_SCHEMA_BYTES = 512 << 10;
+var MAX_RESPONSE_BYTES = 4 << 20;
+var ModelUnavailableError = class extends Error {
+  constructor(message = "Model review is unavailable for this adversary execution.") {
+    super(message);
+    this.name = "ModelUnavailableError";
+  }
+};
+var ModelReviewError = class extends Error {
+  code;
+  retryable;
+  constructor(message, options = {}) {
+    super(message);
+    this.name = "ModelReviewError";
+    this.code = options.code;
+    this.retryable = options.retryable ?? false;
+  }
+};
+function createModelFromEnvironment(environment = process.env) {
+  const endpoint = environment[ADVERSARY_MODEL_ENDPOINT_ENV]?.trim();
+  const token = environment[ADVERSARY_MODEL_TOKEN_ENV]?.trim();
+  if (endpoint === void 0 || endpoint === "" || token === void 0 || token === "") {
+    return unavailableModel();
+  }
+  return new BrokerReviewModel(endpoint, token);
+}
+function unavailableModel() {
+  return Object.freeze({
+    async review() {
+      throw new ModelUnavailableError();
+    }
+  });
+}
+var BrokerReviewModel = class {
+  endpoint;
+  #token;
+  constructor(endpoint, token) {
+    const parsed = new URL(endpoint);
+    if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" && parsed.hostname !== "::1" && parsed.hostname !== "[::1]" && parsed.hostname !== "localhost") {
+      throw new ModelReviewError("The model broker endpoint must use HTTP on the local loopback interface.", { code: "invalid_broker_endpoint" });
+    }
+    if (token.trim() === "") {
+      throw new ModelReviewError("The model broker token must not be empty.", {
+        code: "invalid_broker_token"
+      });
+    }
+    this.endpoint = parsed.toString();
+    this.#token = token;
+  }
+  async review(request) {
+    const normalized = normalizeRequest(request);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), normalized.budget.timeoutMs);
+    try {
+      let response;
+      try {
+        response = await fetch(this.endpoint, {
+          method: "POST",
+          headers: {
+            accept: "application/json",
+            authorization: `Bearer ${this.#token}`,
+            "content-type": "application/json",
+            "x-adversary-model-protocol": String(ADVERSARY_MODEL_PROTOCOL_VERSION)
+          },
+          body: JSON.stringify({
+            protocolVersion: ADVERSARY_MODEL_PROTOCOL_VERSION,
+            prompt: normalized.prompt,
+            input: normalized.input,
+            schema: normalized.schema,
+            budget: normalized.budget
+          }),
+          signal: controller.signal
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw modelTimeoutError(normalized.budget.timeoutMs);
+        }
+        throw new ModelReviewError(`Model broker request failed: ${error instanceof Error ? error.message : String(error)}`, { code: "broker_unavailable", retryable: true });
+      }
+      let body2;
+      try {
+        body2 = await readBoundedResponse(response);
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw modelTimeoutError(normalized.budget.timeoutMs);
+        }
+        throw error;
+      }
+      let decoded;
+      try {
+        decoded = JSON.parse(body2);
+      } catch {
+        throw new ModelReviewError("Model broker returned malformed JSON.", {
+          code: "invalid_broker_response"
+        });
+      }
+      if (!response.ok) {
+        const failure = decoded;
+        throw new ModelReviewError(failure.error?.message ?? `Model broker returned HTTP ${response.status}.`, {
+          code: failure.error?.code ?? "model_review_failed",
+          retryable: failure.error?.retryable ?? response.status >= 500
+        });
+      }
+      const envelope = requireBrokerResponse(decoded);
+      validateModelOutput(normalized.schema, envelope.output);
+      return {
+        output: envelope.output,
+        provider: envelope.provider,
+        model: envelope.model,
+        ...envelope.usage === void 0 ? {} : { usage: envelope.usage }
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+};
+function modelTimeoutError(timeoutMs) {
+  return new ModelReviewError(`Model review exceeded its ${timeoutMs}ms timeout.`, {
+    code: "model_timeout",
+    retryable: true
+  });
+}
+function normalizeRequest(request) {
+  if (typeof request !== "object" || request === null) {
+    throw new ModelReviewError("Model review request must be an object.", {
+      code: "invalid_model_request"
+    });
+  }
+  if (typeof request.prompt !== "string" || request.prompt.trim() === "") {
+    throw new ModelReviewError("Model review prompt must be a non-empty string.", {
+      code: "invalid_model_request"
+    });
+  }
+  const promptBytes = Buffer.byteLength(request.prompt, "utf8");
+  if (promptBytes > MAX_PROMPT_BYTES) {
+    throw new ModelReviewError(`Model review prompt exceeds ${MAX_PROMPT_BYTES} bytes.`, {
+      code: "model_request_too_large"
+    });
+  }
+  requireJsonSize(request.input, "input", MAX_INPUT_BYTES);
+  if (typeof request.schema !== "object" || request.schema === null || Array.isArray(request.schema)) {
+    throw new ModelReviewError("Model review schema must be a JSON Schema object.", {
+      code: "invalid_model_schema"
+    });
+  }
+  requireJsonSize(request.schema, "schema", MAX_SCHEMA_BYTES);
+  const maximumOutputTokens = request.budget?.maximumOutputTokens ?? DEFAULT_MAXIMUM_OUTPUT_TOKENS;
+  const timeoutMs = request.budget?.timeoutMs ?? DEFAULT_MODEL_TIMEOUT_MS;
+  requireIntegerRange(maximumOutputTokens, "budget.maximumOutputTokens", 1, MAX_MAXIMUM_OUTPUT_TOKENS);
+  requireIntegerRange(timeoutMs, "budget.timeoutMs", 1, MAX_MODEL_TIMEOUT_MS);
+  return {
+    prompt: request.prompt,
+    input: request.input,
+    schema: request.schema,
+    budget: { maximumOutputTokens, timeoutMs }
+  };
+}
+function requireJsonSize(value, name2, maximum) {
+  let encoded;
+  try {
+    encoded = JSON.stringify(value);
+  } catch (error) {
+    throw new ModelReviewError(`Model review ${name2} must be JSON-serializable: ${error instanceof Error ? error.message : String(error)}`, { code: "invalid_model_request" });
+  }
+  if (encoded === void 0) {
+    throw new ModelReviewError(`Model review ${name2} must be JSON-serializable.`, {
+      code: "invalid_model_request"
+    });
+  }
+  if (Buffer.byteLength(encoded, "utf8") > maximum) {
+    throw new ModelReviewError(`Model review ${name2} exceeds ${maximum} bytes.`, {
+      code: "model_request_too_large"
+    });
+  }
+}
+function requireIntegerRange(value, name2, minimum, maximum) {
+  if (!Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new ModelReviewError(`${name2} must be an integer from ${minimum} through ${maximum}.`, {
+      code: "invalid_model_budget"
+    });
+  }
+}
+async function readBoundedResponse(response) {
+  const declared = response.headers.get("content-length");
+  if (declared !== null && Number(declared) > MAX_RESPONSE_BYTES) {
+    throw new ModelReviewError(`Model broker response exceeds ${MAX_RESPONSE_BYTES} bytes.`, {
+      code: "model_response_too_large"
+    });
+  }
+  if (response.body === null) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (; ; ) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    size += value.byteLength;
+    if (size > MAX_RESPONSE_BYTES) {
+      await reader.cancel();
+      throw new ModelReviewError(`Model broker response exceeds ${MAX_RESPONSE_BYTES} bytes.`, {
+        code: "model_response_too_large"
+      });
+    }
+    chunks.push(value);
+  }
+  const joined = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+function requireBrokerResponse(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ModelReviewError("Model broker response must be an object.", {
+      code: "invalid_broker_response"
+    });
+  }
+  const response = value;
+  if (response.protocolVersion !== ADVERSARY_MODEL_PROTOCOL_VERSION) {
+    throw new ModelReviewError(`Model broker protocol version must be ${ADVERSARY_MODEL_PROTOCOL_VERSION}.`, { code: "unsupported_model_protocol" });
+  }
+  if (typeof response.provider !== "string" || response.provider.trim() === "") {
+    throw new ModelReviewError("Model broker response provider must be a non-empty string.", {
+      code: "invalid_broker_response"
+    });
+  }
+  if (typeof response.model !== "string" || response.model.trim() === "") {
+    throw new ModelReviewError("Model broker response model must be a non-empty string.", {
+      code: "invalid_broker_response"
+    });
+  }
+  if (!Object.hasOwn(response, "output")) {
+    throw new ModelReviewError("Model broker response is missing output.", {
+      code: "invalid_broker_response"
+    });
+  }
+  if (response.usage !== void 0) {
+    validateUsage(response.usage);
+  }
+  return response;
+}
+function validateUsage(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ModelReviewError("Model broker response usage must be an object.", {
+      code: "invalid_broker_response"
+    });
+  }
+  for (const field of ["inputTokens", "outputTokens"]) {
+    const count = value[field];
+    if (count !== void 0 && (!Number.isInteger(count) || count < 0)) {
+      throw new ModelReviewError(`Model broker response usage.${field} must be a non-negative integer.`, {
+        code: "invalid_broker_response"
+      });
+    }
+  }
+}
+function validateModelOutput(schema, output) {
+  const ajv = new import__.Ajv2020({ allErrors: true, strict: true });
+  let validate;
+  try {
+    validate = ajv.compile(schema);
+  } catch (error) {
+    throw new ModelReviewError(`Model review schema is invalid: ${error instanceof Error ? error.message : String(error)}`, { code: "invalid_model_schema" });
+  }
+  if (!validate(output)) {
+    const detail = ajv.errorsText(validate.errors, { separator: "; " });
+    throw new ModelReviewError(`Model output does not match the requested schema: ${detail}`, {
+      code: "invalid_model_output"
+    });
+  }
+}
 
 // node_modules/@adversarylabs/sdk/dist/manifest.js
 var import_yaml = __toESM(require_dist(), 1);
@@ -14540,6 +14829,7 @@ var DEFAULT_CONFIDENCE_THRESHOLDS = {
   medium: 0.6,
   high: 0.85
 };
+var WORKTREE_HEAD_REF = "WORKTREE";
 var RuleRegistry = class _RuleRegistry {
   rules = /* @__PURE__ */ new Map();
   register(rule) {
@@ -14653,7 +14943,8 @@ var Adversary = class {
     const cache = /* @__PURE__ */ new Map();
     const collector = createReviewCollector();
     const registry = this.ruleDefinitions.snapshot();
-    const context = createRuleContext(repoPath, summary, cache, collector, registry);
+    const change = normalizeChangeContext(options.input.change);
+    const context = createRuleContext(repoPath, change, summary, cache, collector, registry, options.model ?? unavailableModel());
     const includeSuppressed = options.includeSuppressed;
     for (const rule of this.rules) {
       log.debug(`running rule ${rule.id}`);
@@ -14666,6 +14957,7 @@ var Adversary = class {
       collector,
       policy: cloneReviewPolicy({ ...this.reviewPolicy, ...options.review }),
       registry,
+      change,
       includeSuppressed,
       includeRawObservations: options.includeRawObservations,
       timing: options.includeTiming ? { totalMs: Math.round(performance.now() - startedAt) } : void 0
@@ -14677,6 +14969,7 @@ var Adversary = class {
     const repository = options.input ? input.source.path : process.env.ADVERSARY_REPO ?? input.source.path;
     const result = await this.run({
       input: { ...input, source: { ...input.source, path: repository } },
+      model: options.model ?? createModelFromEnvironment(),
       review: options.review,
       includeSuppressed: options.includeSuppressed ?? parseBooleanEnv(process.env.ADVERSARY_INCLUDE_SUPPRESSED),
       includeRawObservations: options.includeRawObservations,
@@ -14756,6 +15049,25 @@ async function parseInput(path = DEFAULT_INPUT_PATH) {
   if (typeof parsed.source.path !== "string" || parsed.source.path.length === 0) {
     throw new Error(`Invalid input at ${path}: source.path must be a non-empty string.`);
   }
+  if (parsed.change !== void 0 && parsed.change !== null) {
+    if (!isRecord(parsed.change)) {
+      throw new Error(`Invalid input at ${path}: change must be an object or null.`);
+    }
+    for (const field of ["type", "base_ref", "head_ref", "scan_mode"]) {
+      const value = parsed.change[field];
+      if (value !== void 0 && typeof value !== "string") {
+        throw new Error(`Invalid input at ${path}: change.${field} must be a string.`);
+      }
+    }
+    const scanMode = parsed.change.scan_mode;
+    if (scanMode !== void 0 && scanMode !== "changed" && scanMode !== "all") {
+      throw new Error(`Invalid input at ${path}: change.scan_mode must be "changed" or "all".`);
+    }
+    const changedFiles = parsed.change.changed_files;
+    if (changedFiles !== void 0 && (!Array.isArray(changedFiles) || changedFiles.some((item) => typeof item !== "string"))) {
+      throw new Error(`Invalid input at ${path}: change.changed_files must be an array of strings.`);
+    }
+  }
   return parsed;
 }
 async function writeOutput(output, path = DEFAULT_OUTPUT_PATH) {
@@ -14768,7 +15080,7 @@ async function validateRunEnvelope(output) {
   let validator = envelopeValidator;
   if (validator === void 0) {
     const schema = JSON.parse(await readFile(new URL("../schemas/adversary.review.v1.schema.json", import.meta.url), "utf8"));
-    validator = new import__.Ajv2020({ allErrors: true, strict: true }).compile(schema);
+    validator = new import__2.Ajv2020({ allErrors: true, strict: true }).compile(schema);
     envelopeValidator = validator;
   }
   if (!validator(output)) {
@@ -14807,12 +15119,31 @@ function rankFindings(findings) {
     return compareStrings(left.id, right.id);
   });
 }
-function createRuleContext(repoPath, summary, cache, collector, registry) {
+function normalizeChangeContext(change) {
+  if (change === void 0 || change === null) {
+    return null;
+  }
+  const scanMode = change.scan_mode ?? "changed";
+  if (scanMode !== "changed" && scanMode !== "all") {
+    throw new Error(`Unsupported change scan_mode "${change.scan_mode}".`);
+  }
+  return Object.freeze({
+    ...change.type === void 0 ? {} : { type: change.type },
+    ...change.base_ref === void 0 ? {} : { baseRef: change.base_ref },
+    ...change.head_ref === void 0 ? {} : { headRef: change.head_ref },
+    scanMode,
+    changedFiles: Object.freeze([...change.changed_files ?? []]),
+    worktree: change.head_ref === WORKTREE_HEAD_REF
+  });
+}
+function createRuleContext(repoPath, change, summary, cache, collector, registry, model) {
   const absoluteRepoPath = resolve(repoPath);
   return {
     repoPath: absoluteRepoPath,
+    change,
     summary,
     cache,
+    model: enhanceReviewModel(model),
     relpath(path) {
       return relative(absoluteRepoPath, isAbsolute(path) ? path : resolve(absoluteRepoPath, path));
     },
@@ -14932,7 +15263,7 @@ function buildReviewResult(input) {
     positives,
     observations: reviewObservations,
     findings: eligible,
-    opinion: input.collector.opinion ?? synthesizeOpinion(eligible),
+    opinion: input.collector.opinion ?? synthesizeOpinion(eligible, input.change ?? null),
     suppressed: {
       observations: synthesis.suppressedObservations,
       findings: suppressedFindings.length
@@ -15160,7 +15491,7 @@ function assessmentConcern(finding) {
   return concernClause(lowercaseFirst(trimTrailingSentencePunctuation(summary ?? findingConcern(finding))));
 }
 function concernClause(concern) {
-  const isClause = /\b(?:allows|are|builds|can|contains|copies|could|did|do|does|exposes|has|have|includes|installs|is|lacks|may|might|must|reads|references|relies|requires|runs|uses|was|were|writes)\b/i.test(concern);
+  const isClause = /\b(?:allows|are|binds|blocks|builds|bypasses|calls|can|closes|contains|copies|could|creates|detaches|did|discards|do|does|exits|exposes|fails|forks|has|have|ignores|includes|installs|is|kills|lacks|leaks|leaves|logs|maps|may|might|must|opens|panics|prints|reads|references|relies|replaces|requires|returns|runs|skips|spawns|starts|terminates|throws|uses|was|were|writes)\b\s+\S+/i.test(concern);
   if (!isClause) {
     return concern;
   }
@@ -15170,26 +15501,272 @@ function concernClause(concern) {
 function joinSentences(...sentences) {
   return sentences.filter(isNonEmptyString).join(" ");
 }
-function synthesizeOpinion(findings) {
-  if (findings.length === 0) {
+function resolveReviewPosture(change) {
+  if (change === null || change === void 0 || change.scanMode === "all") {
+    return "repository";
+  }
+  if (change.worktree) {
+    return "worktree";
+  }
+  return "change";
+}
+var MAX_OPINION_CONCERN_LENGTH = 100;
+function isOpinionConcernPhrase(concern) {
+  try {
+    requireOpinionConcern(concern);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function requireOpinionConcern(concern, label = "opinion concern") {
+  if (typeof concern !== "string") {
+    throw new Error(`${label} must be a string.`);
+  }
+  const trimmed = concern.trim();
+  if (trimmed === "") {
+    throw new Error(`${label} must be a non-empty noun phrase suitable after "address \u2026" (for example "direct process termination").`);
+  }
+  if (/[.!?]/.test(trimmed)) {
+    throw new Error(`${label} must be a noun phrase, not a sentence (remove ".!?").`);
+  }
+  const normalized = lowercaseFirst(normalizeParagraph(trimmed));
+  if (!isNonEmptyString(normalized)) {
+    throw new Error(`${label} must be a non-empty noun phrase suitable after "address \u2026" (for example "direct process termination").`);
+  }
+  if (normalized.length > MAX_OPINION_CONCERN_LENGTH) {
+    throw new Error(`${label} must be at most ${MAX_OPINION_CONCERN_LENGTH} characters (got ${normalized.length}).`);
+  }
+  if (looksLikeFiniteClause(normalized)) {
+    throw new Error(`${label} must be a noun phrase (for example "direct process termination"), not a clause (for example "commands replace inherited context").`);
+  }
+  if (looksLikeHeadlineNotNounPhrase(normalized)) {
+    throw new Error(`${label} must be a short noun phrase, not a headline (for example use "silent no-op v1 paths", not "api get/post/patch/put silently no-op for v1 paths").`);
+  }
+  return normalized;
+}
+var OPINION_CONCERN_REWRITE_PROMPT = `Rewrite the input text into a short noun phrase suitable after the words "I would address".
+
+Rules:
+- Return only a noun phrase (for example "direct process termination below the application boundary" or "forced exit code 124")
+- Do not write a full sentence or finite clause (not "commands replace inherited context")
+- No terminal punctuation (.!?)
+- No dotted code identifiers (not "os.Exit" or "context.Background")
+- No slash-separated method lists (not "get/post/patch/put")
+- At most ${MAX_OPINION_CONCERN_LENGTH} characters
+- Prefer the primary engineering concern over command inventories or headlines`;
+var OPINION_CONCERN_REWRITE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["concern"],
+  properties: {
+    concern: {
+      type: "string",
+      minLength: 3,
+      maxLength: MAX_OPINION_CONCERN_LENGTH
+    }
+  }
+};
+var DEFAULT_CONCERN_REWRITE_BUDGET = {
+  maximumOutputTokens: 128,
+  timeoutMs: 3e4
+};
+async function rewriteOpinionConcern(model, request) {
+  if (typeof request !== "object" || request === null) {
+    throw new ModelReviewError("Model concern request must be an object.", {
+      code: "invalid_model_request"
+    });
+  }
+  if (typeof request.text !== "string") {
+    throw new ModelReviewError("Model concern text must be a string.", {
+      code: "invalid_model_request"
+    });
+  }
+  const text = request.text.trim();
+  if (text === "") {
+    throw new ModelReviewError("Model concern text must be a non-empty string.", {
+      code: "invalid_model_request"
+    });
+  }
+  if (isOpinionConcernPhrase(text)) {
+    return {
+      concern: requireOpinionConcern(text),
+      rewritten: false,
+      provider: "local",
+      model: "passthrough"
+    };
+  }
+  const maxAttempts = request.maxAttempts === void 0 ? 2 : requirePositiveInteger(request.maxAttempts, "maxAttempts", 4);
+  const budget = {
+    maximumOutputTokens: request.budget?.maximumOutputTokens ?? DEFAULT_CONCERN_REWRITE_BUDGET.maximumOutputTokens,
+    timeoutMs: request.budget?.timeoutMs ?? DEFAULT_CONCERN_REWRITE_BUDGET.timeoutMs
+  };
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const prompt = attempt === 1 ? OPINION_CONCERN_REWRITE_PROMPT : `${OPINION_CONCERN_REWRITE_PROMPT}
+
+Previous attempt was rejected: ${lastError ?? "invalid noun phrase"}.
+Return only a pure noun phrase that passes validation.`;
+    const result = await model.review({
+      prompt,
+      input: {
+        text,
+        ...lastError === void 0 ? {} : { previousError: lastError }
+      },
+      schema: OPINION_CONCERN_REWRITE_SCHEMA,
+      budget
+    });
+    try {
+      const concern = requireOpinionConcern(result.output.concern, "model concern rewrite");
+      return {
+        concern,
+        rewritten: true,
+        provider: result.provider,
+        model: result.model,
+        ...result.usage === void 0 ? {} : { usage: result.usage }
+      };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  throw new ModelReviewError(`Model failed to produce a valid opinion concern after ${maxAttempts} attempts${lastError === void 0 ? "" : `: ${lastError}`}.`, { code: "invalid_opinion_concern" });
+}
+function enhanceReviewModel(model) {
+  return {
+    review: (request) => model.review(request),
+    concern: (request) => rewriteOpinionConcern(model, request)
+  };
+}
+function requirePositiveInteger(value, name2, maximum) {
+  if (!Number.isInteger(value) || value < 1 || value > maximum) {
+    throw new ModelReviewError(`${name2} must be an integer from 1 through ${maximum}.`, {
+      code: "invalid_model_request"
+    });
+  }
+  return value;
+}
+function formatOpinion(options) {
+  if (typeof options.ship !== "boolean") {
+    throw new Error("formatOpinion requires a boolean ship decision.");
+  }
+  const posture = options.posture === void 0 ? resolveReviewPosture(options.change ?? null) : parseReviewPosture(options.posture, "formatOpinion posture");
+  const deadline = opinionDeadline(posture);
+  const remainingCount = options.remainingCount ?? 0;
+  if (remainingCount > 1) {
+    return {
+      ship: options.ship,
+      summary: `I would address the remaining findings ${deadline}.`
+    };
+  }
+  const concern = options.concern === void 0 || options.concern.trim() === "" ? void 0 : requireOpinionConcern(options.concern, "formatOpinion concern");
+  if (options.ship) {
+    if (concern === void 0) {
+      return { ship: true, summary: opinionApproveAsIs(posture) };
+    }
     return {
       ship: true,
-      summary: "I would ship this as-is."
+      summary: opinionApproveWithFollowUp(posture, concern)
     };
+  }
+  if (concern === void 0) {
+    return {
+      ship: false,
+      summary: `I would address the remaining findings ${deadline}.`
+    };
+  }
+  return {
+    ship: false,
+    summary: `I would address ${concern} ${deadline}.`
+  };
+}
+function looksLikeFiniteClause(concern) {
+  if (/\b(?:allows|are|binds|blocks|builds|bypasses|calls|can|closes|contains|copies|could|creates|detaches|did|discards|do|does|exits|exposes|fails|forks|has|have|ignores|includes|installs|is|kills|lacks|leaks|leaves|logs|maps|may|might|must|opens|panics|prints|reads|references|relies|replaces|requires|returns|runs|skips|spawns|starts|terminates|throws|uses|was|were|writes)\b\s+\S+/i.test(concern)) {
+    return true;
+  }
+  if (/(?:^|\s)(?:replace|replaces|discard|discards|force|forces|override|overrides|cause|causes|prevent|prevents|block|blocks|break|breaks|succeed|succeeds|fail|fails|mix|mixes|omit|omits|ignore|ignores)\s+\S+/i.test(concern)) {
+    return true;
+  }
+  return false;
+}
+function looksLikeHeadlineNotNounPhrase(concern) {
+  if ((concern.match(/\//g) ?? []).length >= 2) {
+    return true;
+  }
+  if (/(?:^|\s)(?:get|post|patch|put|delete)\/(?:get|post|patch|put|delete)/i.test(concern)) {
+    return true;
+  }
+  if (/\bsilently\b/i.test(concern)) {
+    return true;
+  }
+  if (/,\s+(?:breaking|causing|preventing|leaving|blocking|forcing|overriding|so\b|which\b|and then\b)/i.test(concern)) {
+    return true;
+  }
+  return false;
+}
+function parseReviewPosture(value, label) {
+  if (value === "repository" || value === "change" || value === "worktree") {
+    return value;
+  }
+  throw new Error(`${label} must be one of repository, change, or worktree.`);
+}
+function opinionDeadline(posture) {
+  switch (posture) {
+    case "worktree":
+      return "before committing";
+    case "change":
+      return "before merging";
+    case "repository":
+      return "before shipping";
+    default: {
+      const _exhaustive = posture;
+      throw new Error(`unsupported review posture: ${String(_exhaustive)}`);
+    }
+  }
+}
+function opinionApproveAsIs(posture) {
+  switch (posture) {
+    case "worktree":
+      return "I would land these local changes as-is.";
+    case "change":
+      return "I would merge this change as-is.";
+    case "repository":
+      return "I would ship this as-is.";
+    default: {
+      const _exhaustive = posture;
+      throw new Error(`unsupported review posture: ${String(_exhaustive)}`);
+    }
+  }
+}
+function opinionApproveWithFollowUp(posture, concern) {
+  switch (posture) {
+    case "worktree":
+      return `I would land these local changes and address ${concern} as follow-up hardening.`;
+    case "change":
+      return `I would merge this change and address ${concern} as follow-up hardening.`;
+    case "repository":
+      return `I would ship this as-is. Addressing ${concern} is the only improvement I would recommend before shipping.`;
+    default: {
+      const _exhaustive = posture;
+      throw new Error(`unsupported review posture: ${String(_exhaustive)}`);
+    }
+  }
+}
+function synthesizeOpinion(findings, change) {
+  const posture = resolveReviewPosture(change);
+  const deadline = opinionDeadline(posture);
+  if (findings.length === 0) {
+    return formatOpinion({ ship: true, posture });
   }
   const highestSeverity = highestFindingSeverity(findings);
   const ship = severityWeight(highestSeverity) < severityWeight(Severity.High);
   if (findings.length > 1) {
-    return {
-      ship,
-      summary: "I would address the remaining findings before production."
-    };
+    return formatOpinion({ ship, remainingCount: findings.length, posture });
   }
   const finding = findings[0];
   const improvement = finding === void 0 ? "Addressing the finding" : improvementPhrase(finding);
   return {
     ship,
-    summary: ship ? `I would ship this as-is. ${improvement} is the only improvement I would recommend before production.` : `${improvement} is the most important improvement to address before production.`
+    summary: ship ? `${opinionApproveAsIs(posture)} ${improvement} is the only improvement I would recommend ${deadline}.` : `${improvement} is the most important improvement to address ${deadline}.`
   };
 }
 function deduplicateScores(scores) {
@@ -15830,6 +16407,7 @@ var domain = {
     {
       id: "go-http.server-timeouts",
       title: "The HTTP server has no header-read timeout",
+      concern: "missing HTTP server header-read timeouts",
       category: "reliability",
       severity: "high",
       confidence: "high",
@@ -15841,6 +16419,7 @@ var domain = {
     {
       id: "go-http.body-limit",
       title: "A request body is buffered without an explicit size limit",
+      concern: "unbounded HTTP request body buffering",
       category: "security",
       severity: "high",
       confidence: "high",
@@ -15852,6 +16431,7 @@ var domain = {
     {
       id: "go-http.graceful-shutdown",
       title: "The server lifecycle has no graceful shutdown path",
+      concern: "HTTP servers without graceful shutdown",
       category: "reliability",
       severity: "medium",
       confidence: "high",
@@ -15859,25 +16439,98 @@ var domain = {
       whyItMatters: "Production termination must stop admission while allowing in-flight requests to drain.",
       impact: "Deploys and interrupts can drop active requests and abandon response work.",
       recommendation: "Own an http.Server, listen for cancellation, and call Shutdown with a bounded context."
+    },
+    {
+      id: "go-http.client-no-timeout",
+      title: "An HTTP client has no timeout budget",
+      concern: "HTTP clients without timeout budgets",
+      category: "reliability",
+      severity: "high",
+      confidence: "high",
+      summary: (count) => `${count} HTTP client${count === 1 ? "" : "s"} are constructed without an explicit Timeout.`,
+      whyItMatters: "Outbound calls without a deadline hang indefinitely against dead peers and can exhaust goroutines.",
+      impact: "Workers and CLI commands wedge on network partitions with no user-visible deadline.",
+      recommendation: "Set http.Client.Timeout or always pair requests with context deadlines."
+    },
+    {
+      id: "go-http.request-no-context",
+      title: "An HTTP request is built without a context",
+      concern: "HTTP requests without cancellation contexts",
+      category: "reliability",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) => `${count} request construction${count === 1 ? "" : "s"} use NewRequest without a parent context.`,
+      whyItMatters: "Caller cancellation and deadlines only propagate through RequestWithContext.",
+      impact: "Cancelled work continues consuming connections after the caller has abandoned the operation.",
+      recommendation: "Use http.NewRequestWithContext with the owning request, command, or worker context."
+    },
+    {
+      id: "go-http.default-client",
+      title: "Package-level DefaultClient helpers perform outbound calls",
+      concern: "unbounded DefaultClient HTTP helpers",
+      category: "reliability",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) => `${count} call${count === 1 ? "" : "s"} use http.Get/Post/Head/PostForm without an owned client timeout.`,
+      whyItMatters: "http.DefaultClient has no Timeout and is shared process-wide.",
+      impact: "One hung call can leave sockets and goroutines open indefinitely.",
+      recommendation: "Construct an http.Client with Timeout (or Transport limits) and call client.Do with a context."
     }
   ],
-  noRiskSummary: "The reviewed HTTP boundaries include bounded input, server timing, and graceful lifecycle ownership.",
-  approvalSummary: "I would approve the reviewed HTTP request and server lifecycle.",
+  noRiskSummary: "The reviewed HTTP boundaries include bounded input, server timing, graceful lifecycle ownership, and outbound deadlines.",
+  approvalSummary: "I would approve the reviewed HTTP request, client, and server lifecycle.",
   analyze(file) {
     const signals = [
       ...file.current.includes("http.Server{") && !file.current.includes("ReadHeaderTimeout:") ? contentSignal(file, "go-http.server-timeouts", /http\.Server\s*\{/, "This server is constructed without ReadHeaderTimeout.") : [],
       ...file.current.includes("io.ReadAll(") && !/(MaxBytesReader|LimitReader)\s*\(/.test(file.current) ? lineSignals(file, "go-http.body-limit", /\bio\.ReadAll\s*\(/, () => "The request body is fully buffered without a visible size bound.") : [],
-      ...file.current.includes("ListenAndServe(") && !/\.Shutdown\s*\(/.test(file.current) ? lineSignals(file, "go-http.graceful-shutdown", /\b(?:http\.)?ListenAndServe\s*\(/, () => "Server startup has no matching graceful shutdown path in this lifecycle.") : []
+      ...file.current.includes("ListenAndServe(") && !/\.Shutdown\s*\(/.test(file.current) ? lineSignals(file, "go-http.graceful-shutdown", /\b(?:http\.)?ListenAndServe\s*\(/, () => "Server startup has no matching graceful shutdown path in this lifecycle.") : [],
+      ...clientNoTimeoutSignals(file),
+      ...lineSignals(
+        file,
+        "go-http.request-no-context",
+        /\bhttp\.NewRequest\s*\(/,
+        () => "This request is constructed without a parent context."
+      ),
+      ...lineSignals(
+        file,
+        "go-http.default-client",
+        /\bhttp\.(?:Get|Post|Head|PostForm)\s*\(/,
+        () => "This call uses the process DefaultClient without an explicit timeout."
+      )
     ];
     return {
       signals,
       positives: [
         ...positive(file, "go-http.request-bounded", /\bhttp\.MaxBytesReader\s*\(/, "Request body size is bounded before consumption."),
-        ...positive(file, "go-http.shutdown-owned", /\.Shutdown\s*\(/, "Server shutdown is explicitly owned and drainable.")
+        ...positive(file, "go-http.shutdown-owned", /\.Shutdown\s*\(/, "Server shutdown is explicitly owned and drainable."),
+        ...positive(file, "go-http.client-timeout", /http\.Client\s*\{[^}]*Timeout\s*:/s, "An HTTP client declares an explicit Timeout."),
+        ...positive(file, "go-http.request-context", /\bhttp\.NewRequestWithContext\s*\(/, "Outbound requests carry a parent context.")
       ]
     };
   }
 };
+function clientNoTimeoutSignals(file) {
+  if (!/http\.Client\s*\{/.test(file.current)) return [];
+  const signals = [];
+  const re = /http\.Client\s*\{/g;
+  let match;
+  while ((match = re.exec(file.current)) !== null) {
+    const start2 = match.index;
+    const slice = file.current.slice(start2, start2 + 400);
+    if (!/\bTimeout\s*:/.test(slice)) {
+      const line = file.current.slice(0, start2).split("\n").length;
+      signals.push({
+        ruleId: "go-http.client-no-timeout",
+        path: file.path,
+        line,
+        message: "This HTTP client is constructed without Timeout.",
+        snippet: slice.split("\n")[0]?.trim().slice(0, 300) ?? "http.Client{",
+        data: {}
+      });
+    }
+  }
+  return signals;
+}
 
 // src/parser.ts
 import { existsSync } from "node:fs";
@@ -20058,24 +20711,334 @@ function parseNameStatus(output) {
   });
 }
 
+// src/model-review.ts
+var MAX_MODEL_FILES = 16;
+var MAX_FILE_CHARS = 6e3;
+var MAX_DETERMINISTIC_SIGNALS = 40;
+var MAX_MODEL_OBSERVATIONS = 6;
+var GO_HTTP_MODEL_PROMPT = `You are reviewing Go HTTP code for request boundaries, server lifecycle, and outbound client correctness.
+
+Authority:
+- server timeouts, body limits, graceful shutdown
+- outbound http.Client timeouts and request contexts
+- DefaultClient / http.Get/Post without deadlines
+- auth header handling only when it creates a concrete HTTP contract risk
+
+Do NOT review generic Go style, CLI UX, databases, or Kubernetes.
+Prefer silence over speculation. Zero to six observations. Cite only evidenceIds from the catalog.
+Do not restate deterministic signals without added judgment.
+primaryConcern is a short noun phrase after "I would address", empty when ship is true.
+Return JSON matching the schema only.`;
+var GO_HTTP_MODEL_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["assessment", "ship", "observations"],
+  properties: {
+    assessment: {
+      type: "object",
+      additionalProperties: false,
+      required: ["risk", "summary"],
+      properties: {
+        risk: {
+          type: "string",
+          enum: ["none", "low", "medium", "high", "critical"]
+        },
+        summary: { type: "string", minLength: 1, maxLength: 800 }
+      }
+    },
+    ship: { type: "boolean" },
+    primaryConcern: { type: "string", minLength: 1, maxLength: 120 },
+    observations: {
+      type: "array",
+      maxItems: MAX_MODEL_OBSERVATIONS,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "id",
+          "title",
+          "category",
+          "severity",
+          "confidence",
+          "summary",
+          "whyItMatters",
+          "recommendation",
+          "evidenceIds"
+        ],
+        properties: {
+          id: { type: "string", minLength: 1, maxLength: 64 },
+          title: { type: "string", minLength: 1, maxLength: 160 },
+          category: {
+            type: "string",
+            enum: [
+              "server-timeouts",
+              "body-limit",
+              "graceful-shutdown",
+              "client-timeout",
+              "request-context",
+              "default-client",
+              "auth-headers",
+              "completeness"
+            ]
+          },
+          severity: {
+            type: "string",
+            enum: ["low", "medium", "high", "critical"]
+          },
+          confidence: {
+            type: "string",
+            enum: ["medium", "high"]
+          },
+          summary: { type: "string", minLength: 1, maxLength: 500 },
+          whyItMatters: { type: "string", minLength: 1, maxLength: 500 },
+          recommendation: { type: "string", minLength: 1, maxLength: 500 },
+          evidenceIds: {
+            type: "array",
+            minItems: 1,
+            maxItems: 8,
+            items: { type: "string", minLength: 1, maxLength: 96 }
+          }
+        }
+      }
+    }
+  }
+};
+function prepareModelInputFromDiscovery(change, analysis, files) {
+  const evidenceCatalog = [];
+  const deterministicSignals = analysis.signals.slice().sort(
+    (left, right) => left.path.localeCompare(right.path) || left.line - right.line || left.ruleId.localeCompare(right.ruleId)
+  ).slice(0, MAX_DETERMINISTIC_SIGNALS).map((signal) => {
+    const id = evidenceIdForSignal(signal);
+    evidenceCatalog.push({
+      id,
+      kind: "deterministic",
+      path: signal.path,
+      line: signal.line,
+      message: signal.message,
+      snippet: signal.snippet.slice(0, 300)
+    });
+    return {
+      id,
+      ruleId: signal.ruleId,
+      path: signal.path,
+      line: signal.line,
+      message: signal.message,
+      snippet: signal.snippet.slice(0, 300)
+    };
+  });
+  const byPath = new Map(files.map((file) => [file.path, file]));
+  const pathOrder = [
+    .../* @__PURE__ */ new Set([
+      ...analysis.signals.map((signal) => signal.path),
+      ...change?.changedFiles ?? [],
+      ...files.map((file) => file.path)
+    ])
+  ].sort((left, right) => {
+    const changed2 = new Set(change?.changedFiles ?? []);
+    const leftChanged = changed2.has(left) ? 0 : 1;
+    const rightChanged = changed2.has(right) ? 0 : 1;
+    if (leftChanged !== rightChanged) return leftChanged - rightChanged;
+    return left.localeCompare(right);
+  });
+  const sources = [];
+  for (const path of pathOrder) {
+    if (sources.length >= MAX_MODEL_FILES) break;
+    const file = byPath.get(path);
+    if (file === void 0) continue;
+    const truncated = file.current.length > MAX_FILE_CHARS;
+    const content = truncated ? `${file.current.slice(0, MAX_FILE_CHARS)}
+/* truncated */
+` : file.current;
+    const id = `file:${path}`;
+    sources.push({
+      id,
+      path,
+      status: file.status,
+      content,
+      truncated
+    });
+    evidenceCatalog.push({
+      id,
+      kind: "source",
+      path,
+      message: `Prepared source excerpt for ${path}`,
+      snippet: content.split("\n").slice(0, 3).join("\n").slice(0, 300)
+    });
+  }
+  return {
+    domain: "go-http",
+    change: {
+      scanMode: change === null ? "repository" : change.scanMode,
+      ...change?.baseRef === void 0 ? {} : { baseRef: change.baseRef },
+      ...change?.headRef === void 0 ? {} : { headRef: change.headRef },
+      ...change === null ? {} : { worktree: change.worktree },
+      changedFiles: [...change?.changedFiles ?? []].slice(0, 100)
+    },
+    deterministicSignals,
+    sources,
+    evidenceCatalog
+  };
+}
+function buildModelReviewRequestFromDiscovery(change, analysis, files) {
+  const input = prepareModelInputFromDiscovery(change, analysis, files);
+  const evidenceById = new Map(input.evidenceCatalog.map((item) => [item.id, item]));
+  return {
+    input,
+    evidenceById,
+    request: {
+      prompt: GO_HTTP_MODEL_PROMPT,
+      input,
+      schema: GO_HTTP_MODEL_SCHEMA,
+      budget: {
+        maximumOutputTokens: 4096,
+        timeoutMs: 12e4
+      }
+    }
+  };
+}
+async function applyModelHttpReview(ctx, output, evidenceById, staticSeverities = [], staticPrimaryConcern) {
+  const modelObservationSeverities = output.observations.map((item) => item.severity);
+  const risk = maxSeverity([
+    output.assessment.risk,
+    ...staticSeverities,
+    ...modelObservationSeverities
+  ]);
+  ctx.review.assessment({
+    risk,
+    summary: output.assessment.summary
+  });
+  const rankedObservations = output.observations.slice().sort(
+    (left, right) => severityRank(right.severity) - severityRank(left.severity) || left.id.localeCompare(right.id)
+  );
+  const blocking = staticSeverities.some((severity) => severityRank(severity) >= severityRank("medium")) || modelObservationSeverities.some((severity) => severityRank(severity) >= severityRank("medium"));
+  const ship = output.ship && !blocking;
+  const topModel = rankedObservations[0];
+  const staticMax = maxSeverity(staticSeverities);
+  const modelMax = maxSeverity(modelObservationSeverities);
+  const modelCandidates = [topModel?.title, output.primaryConcern];
+  const staticCandidates = [staticPrimaryConcern];
+  const ordered = severityRank(staticMax) > severityRank(modelMax) ? [...staticCandidates, ...modelCandidates] : [...modelCandidates, ...staticCandidates];
+  const concern = await resolveOpinionConcern(ctx, ordered);
+  ctx.review.opinion(
+    formatOpinion({
+      ship,
+      ...concern === void 0 ? {} : { concern },
+      change: ctx.change
+    })
+  );
+  for (const observation of output.observations.slice(0, MAX_MODEL_OBSERVATIONS)) {
+    const evidence = observation.evidenceIds.map((id) => evidenceById.get(id)).filter((item) => item !== void 0).slice(0, 8).map((item) => ({
+      location: {
+        file: item.path,
+        ...item.line === void 0 ? {} : { line: item.line }
+      },
+      message: item.message,
+      snippet: item.snippet
+    }));
+    ctx.review.observe({
+      key: `go-http.model.${observation.id}`,
+      summary: `[${observation.severity}/${observation.confidence}] ${observation.title}: ${observation.summary}`,
+      ...evidence.length === 0 ? {} : { evidence },
+      metadata: {
+        source: "model",
+        category: observation.category,
+        severity: observation.severity,
+        confidence: observation.confidence,
+        whyItMatters: observation.whyItMatters,
+        recommendation: observation.recommendation,
+        evidenceIds: observation.evidenceIds
+      }
+    });
+  }
+}
+async function runModelHttpReview(ctx, analysis, files, staticSeverities = [], staticPrimaryConcern) {
+  const { request, evidenceById } = buildModelReviewRequestFromDiscovery(
+    ctx.change,
+    analysis,
+    files
+  );
+  try {
+    const result = await ctx.model.review(request);
+    await applyModelHttpReview(
+      ctx,
+      result.output,
+      evidenceById,
+      staticSeverities,
+      staticPrimaryConcern
+    );
+    return "applied";
+  } catch (error) {
+    if (error instanceof ModelUnavailableError) {
+      return "unavailable";
+    }
+    throw error;
+  }
+}
+function evidenceIdForSignal(signal) {
+  return `det:${signal.ruleId}:${signal.path}:${signal.line}`;
+}
+function severityRank(severity) {
+  switch (severity) {
+    case "critical":
+      return 4;
+    case "high":
+      return 3;
+    case "medium":
+      return 2;
+    case "low":
+      return 1;
+    case "none":
+      return 0;
+  }
+}
+async function resolveOpinionConcern(ctx, candidates) {
+  for (const candidate of candidates) {
+    if (candidate === void 0 || candidate.trim() === "") continue;
+    if (isOpinionConcernPhrase(candidate)) {
+      return requireOpinionConcern(candidate);
+    }
+    try {
+      const result = await ctx.model.concern({ text: candidate });
+      return result.concern;
+    } catch {
+    }
+  }
+  return void 0;
+}
+function maxSeverity(values) {
+  let best = "none";
+  for (const value of values) {
+    if (severityRank(value) > severityRank(best)) {
+      best = value;
+    }
+  }
+  return best;
+}
+
 // src/review.ts
 var RISK_ORDER = { none: 0, low: 1, medium: 2, high: 3, critical: 4 };
-function reviewDomain(ctx, analysis) {
-  const active = [];
+var MAX_FINDINGS = 4;
+async function reviewDomain(ctx, analysis, discoveryFiles = []) {
+  const candidates = [];
   for (const rule of domain.rules) {
     const signals = analysis.signals.filter((signal) => signal.ruleId === rule.id);
     if (signals.length === 0) continue;
-    active.push({ rule, signals });
+    candidates.push({ rule, signals });
+  }
+  const active = [...candidates].sort(
+    (left, right) => RISK_ORDER[right.rule.severity] - RISK_ORDER[left.rule.severity] || right.signals.length - left.signals.length || left.rule.id.localeCompare(right.rule.id)
+  ).slice(0, MAX_FINDINGS);
+  for (const item of active) {
     ctx.finding({
-      ruleId: rule.id,
-      title: rule.title,
-      category: rule.category,
-      severity: rule.severity,
-      confidence: rule.confidence,
-      summary: rule.summary(signals.length),
-      whyItMatters: rule.whyItMatters,
-      impact: rule.impact,
-      evidence: signals.slice(0, 12).map((signal) => ({
+      ruleId: item.rule.id,
+      title: item.rule.title,
+      category: item.rule.category,
+      severity: item.rule.severity,
+      confidence: item.rule.confidence,
+      summary: item.rule.summary(item.signals.length),
+      whyItMatters: item.rule.whyItMatters,
+      impact: item.rule.impact,
+      evidence: item.signals.slice(0, 12).map((signal) => ({
         location: {
           file: signal.path,
           line: signal.line,
@@ -20085,25 +21048,41 @@ function reviewDomain(ctx, analysis) {
         snippet: signal.snippet,
         data: signal.data
       })),
-      recommendation: rule.recommendation,
+      recommendation: item.rule.recommendation,
       remediation: { complexity: "small" }
     });
   }
   addPositives(ctx, analysis);
+  const staticSeverities = active.map((item) => item.rule.severity);
+  const staticPrimaryConcern = active[0]?.rule.concern ?? active[0]?.rule.title.toLowerCase();
+  const modelStatus = await runModelHttpReview(
+    ctx,
+    analysis,
+    discoveryFiles,
+    staticSeverities,
+    staticPrimaryConcern
+  );
+  if (modelStatus === "applied") {
+    return;
+  }
   if (active.length === 0) {
     ctx.review.assessment({ risk: "none", summary: domain.noRiskSummary });
     ctx.review.opinion({ ship: true, summary: domain.approvalSummary });
     return;
   }
-  const primary = [...active].sort((left, right) => RISK_ORDER[right.rule.severity] - RISK_ORDER[left.rule.severity] || left.rule.id.localeCompare(right.rule.id))[0];
+  const primary = active[0];
+  const concern = primary.rule.concern ?? primary.rule.title.toLowerCase();
   ctx.review.assessment({
     risk: primary.rule.severity,
     summary: `${primary.rule.title}. ${primary.rule.impact}`
   });
-  ctx.review.opinion({
-    ship: primary.rule.severity === "low",
-    summary: primary.rule.severity === "low" ? `I would merge this change and address ${primary.rule.title.toLowerCase()} as follow-up hardening.` : `I would address ${primary.rule.title.toLowerCase()} before merging.`
-  });
+  ctx.review.opinion(
+    formatOpinion({
+      ship: primary.rule.severity === "low",
+      concern: requireOpinionConcern(concern),
+      change: ctx.change
+    })
+  );
 }
 function addPositives(ctx, analysis) {
   const byKey = /* @__PURE__ */ new Map();
@@ -20128,19 +21107,34 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.1",
+    version: "0.0.2",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {
     const discovery = await discoverSources(ctx.repoPath);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
-    ctx.review.observe({
-      key: domain.observationKey,
-      summary: analysis.mode === "diff" ? `Prepared ${analysis.filesScanned} changed ${domain.sourceDescription} files against ${analysis.base}.` : `Prepared ${analysis.filesScanned} ${domain.sourceDescription} files in repository review mode.`,
-      metadata: { parser: "tree-sitter-go", mode: analysis.mode, parseErrors: analysis.parseErrors }
-    });
-    reviewDomain(ctx, analysis);
+    if (analysis.parseErrors.length > 0) {
+      ctx.review.observe({
+        key: domain.observationKey,
+        summary: `Parsed ${analysis.filesScanned} ${domain.sourceDescription} files with ${analysis.parseErrors.length} parse error${analysis.parseErrors.length === 1 ? "" : "s"}.`,
+        metadata: {
+          role: "context",
+          parser: "tree-sitter-go",
+          mode: analysis.mode,
+          parseErrors: analysis.parseErrors.length
+        }
+      });
+    }
+    await reviewDomain(
+      ctx,
+      analysis,
+      discovery.files.map((file) => ({
+        path: file.path,
+        current: file.current,
+        status: file.status
+      }))
+    );
   });
   return app;
 }

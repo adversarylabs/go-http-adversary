@@ -31,6 +31,7 @@ export interface PositiveSignal {
 export interface RuleDefinition {
   id: string;
   title: string;
+  concern?: string;
   category: string;
   severity: "low" | "medium" | "high" | "critical";
   confidence: "medium" | "high";
