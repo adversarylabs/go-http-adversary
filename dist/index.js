@@ -20971,6 +20971,9 @@ async function runModelHttpReview(ctx, analysis, files, staticSeverities = [], s
     if (error instanceof ModelUnavailableError) {
       return "unavailable";
     }
+    if (error instanceof ModelReviewError || error instanceof Error && /model|broker|fireworks|openai|anthropic/i.test(error.message)) {
+      return "unavailable";
+    }
     throw error;
   }
 }
@@ -21107,7 +21110,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.2",
+    version: "0.0.3",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {

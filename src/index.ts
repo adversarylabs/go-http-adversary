@@ -11,12 +11,12 @@ import { reviewDomain } from "./review.js";
 export function createApp(): Adversary {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.3",
+    version: "0.0.4",
     review: { maximumFindings: 5, minimumConfidence: "medium" },
   });
 
   app.rule(`${domain.name}.review`, async (ctx) => {
-    const discovery = await discoverSources(ctx.repoPath);
+    const discovery = await discoverSources(ctx.repoPath, ctx.change);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
     if (analysis.parseErrors.length > 0) {

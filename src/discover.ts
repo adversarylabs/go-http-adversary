@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { promisify } from "node:util";
+import { type ChangeContext } from "@adversarylabs/sdk";
 import { domain } from "./domain.js";
 import { type Discovery, type SourceRevision } from "./types.js";
 
@@ -12,20 +13,28 @@ const IGNORED_DIRECTORIES = new Set([
 const MAX_FILE_BYTES = 750_000;
 const MAX_FILES = 750;
 
-export async function discoverSources(repoPath: string): Promise<Discovery> {
+export async function discoverSources(
+  repoPath: string,
+  change: ChangeContext | null,
+): Promise<Discovery> {
   if (!(await isGitRepository(repoPath)) || !(await revisionExists(repoPath, "HEAD"))) {
     return { mode: "repository", files: await readSources(repoPath, await repositoryFiles(repoPath)) };
   }
 
-  const worktree = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", "HEAD", "--"]);
-  if (worktree.trim() !== "") return diffDiscovery(repoPath, "HEAD", worktree);
-
-  const base = await chooseBase(repoPath);
-  if (base !== undefined) {
-    const names = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", base, "HEAD", "--"]);
-    if (names.trim() !== "") return diffDiscovery(repoPath, base, names);
+  if (change !== null && change.scanMode === "changed" &&
+    change.baseRef !== undefined && (await revisionExists(repoPath, change.baseRef))) {
+    const head = change.worktree ? [] : ["HEAD"];
+    const names = await gitOutput(
+      repoPath,
+      ["diff", "--name-status", "--find-renames", change.baseRef, ...head, "--"],
+    );
+    return diffDiscovery(repoPath, change.baseRef, names);
   }
 
+  return trackedRepository(repoPath);
+}
+
+async function trackedRepository(repoPath: string): Promise<Discovery> {
   const paths = (await gitOutput(repoPath, ["ls-files", "-z"]))
     .split("\0").filter((path) => domain.includePath(path)).slice(0, MAX_FILES);
   return { mode: "repository", files: await readSources(repoPath, paths) };
@@ -47,16 +56,6 @@ async function diffDiscovery(repoPath: string, base: string, names: string): Pro
     });
   }
   return { mode: "diff", base, files };
-}
-
-async function chooseBase(repoPath: string): Promise<string | undefined> {
-  for (const candidate of ["origin/main", "origin/master", "main", "master"]) {
-    if (!(await revisionExists(repoPath, candidate))) continue;
-    const mergeBase = (await gitOutput(repoPath, ["merge-base", "HEAD", candidate])).trim();
-    const head = (await gitOutput(repoPath, ["rev-parse", "HEAD"])).trim();
-    if (mergeBase !== "" && mergeBase !== head) return mergeBase;
-  }
-  return (await revisionExists(repoPath, "HEAD^")) ? "HEAD^" : undefined;
 }
 
 async function changedLineNumbers(repoPath: string, base: string, path: string): Promise<Set<number>> {
