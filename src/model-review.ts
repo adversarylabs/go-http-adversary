@@ -2,6 +2,7 @@ import {
   formatOpinion,
   isOpinionConcernPhrase,
   ModelUnavailableError,
+  ModelReviewError,
   requireOpinionConcern,
   type ChangeContext,
   type ModelReviewRequest,
@@ -384,6 +385,10 @@ export async function runModelHttpReview(
     return "applied";
   } catch (error) {
     if (error instanceof ModelUnavailableError) {
+      return "unavailable";
+    }
+    // Non-fatal model/provider failures must not hide static findings already emitted.
+    if (error instanceof ModelReviewError || (error instanceof Error && /model|broker|fireworks|openai|anthropic/i.test(error.message))) {
       return "unavailable";
     }
     throw error;
