@@ -1,5 +1,5 @@
 import { contentSignal, lineSignals, positive } from "./signals.js";
-import { type DomainDefinition, type SourceRevision } from "./types.js";
+import { type DomainDefinition, type Signal, type SourceRevision } from "./types.js";
 
 export const domain: DomainDefinition = {
   name: "go-http",
@@ -21,16 +21,28 @@ export const domain: DomainDefinition = {
       recommendation: "Construct http.Server explicitly and set ReadHeaderTimeout plus lifecycle-appropriate read, write, and idle bounds.",
     },
     {
-      id: "go-http.body-limit",
-      title: "A request body is buffered without an explicit size limit",
-      concern: "unbounded HTTP request body buffering",
+      id: "go-http.handler-body-limit",
+      title: "An HTTP handler buffers the request body without a size limit",
+      concern: "unbounded HTTP handler request body buffering",
       category: "security",
       severity: "high",
       confidence: "high",
-      summary: (count) => `${count} handler body read${count === 1 ? "" : "s"} can consume an unbounded request.`,
-      whyItMatters: "Request bodies are attacker-controlled and io.ReadAll allocates until EOF.",
+      summary: (count) => `${count} handler body read${count === 1 ? "" : "s"} can consume an unbounded request body.`,
+      whyItMatters: "Server request bodies are attacker-controlled and io.ReadAll allocates until EOF.",
       impact: "A single request can create memory pressure or terminate the process.",
-      recommendation: "Wrap the body with http.MaxBytesReader or io.LimitReader before decoding or buffering.",
+      recommendation: "Wrap r.Body with http.MaxBytesReader (size class for JSON vs uploads) before decoding or buffering.",
+    },
+    {
+      id: "go-http.client-response-limit",
+      title: "An HTTP client buffers a response body without a size limit",
+      concern: "unbounded HTTP client response buffering",
+      category: "reliability",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) => `${count} client response read${count === 1 ? "" : "s"} buffer the body without a size class.`,
+      whyItMatters: "Outbound peers can return unexpectedly large bodies that exhaust memory.",
+      impact: "A misbehaving or compromised endpoint can OOM the client process.",
+      recommendation: "Read with io.LimitReader using a size class (token JSON vs metadata vs small asset), not an unbounded io.ReadAll.",
     },
     {
       id: "go-http.graceful-shutdown",
@@ -40,9 +52,9 @@ export const domain: DomainDefinition = {
       severity: "medium",
       confidence: "high",
       summary: (count) => `${count} server startup path${count === 1 ? "" : "s"} use ListenAndServe without a matching Shutdown.`,
-      whyItMatters: "Production termination must stop admission while allowing in-flight requests to drain.",
-      impact: "Deploys and interrupts can drop active requests and abandon response work.",
-      recommendation: "Own an http.Server, listen for cancellation, and call Shutdown with a bounded context.",
+      whyItMatters: "Production and long-lived local callback servers must stop admission when the owning context ends.",
+      impact: "Deploys, interrupts, and abandoned login callbacks can drop work or leak listeners.",
+      recommendation: "Own an http.Server, select on caller cancel/timeout, and call Shutdown with a bounded context.",
     },
     {
       id: "go-http.client-no-timeout",
@@ -88,12 +100,8 @@ export const domain: DomainDefinition = {
       ...(file.current.includes("http.Server{") && !file.current.includes("ReadHeaderTimeout:")
         ? contentSignal(file, "go-http.server-timeouts", /http\.Server\s*\{/, "This server is constructed without ReadHeaderTimeout.")
         : []),
-      ...(file.current.includes("io.ReadAll(") && !/(MaxBytesReader|LimitReader)\s*\(/.test(file.current)
-        ? lineSignals(file, "go-http.body-limit", /\bio\.ReadAll\s*\(/, () => "The request body is fully buffered without a visible size bound.")
-        : []),
-      ...(file.current.includes("ListenAndServe(") && !/\.Shutdown\s*\(/.test(file.current)
-        ? lineSignals(file, "go-http.graceful-shutdown", /\b(?:http\.)?ListenAndServe\s*\(/, () => "Server startup has no matching graceful shutdown path in this lifecycle.")
-        : []),
+      ...readAllSignals(file),
+      ...gracefulShutdownSignals(file),
       ...clientNoTimeoutSignals(file),
       ...lineSignals(
         file,
@@ -112,6 +120,7 @@ export const domain: DomainDefinition = {
       signals,
       positives: [
         ...positive(file, "go-http.request-bounded", /\bhttp\.MaxBytesReader\s*\(/, "Request body size is bounded before consumption."),
+        ...positive(file, "go-http.response-bounded", /\bio\.LimitReader\s*\(/, "A body read is wrapped with LimitReader."),
         ...positive(file, "go-http.shutdown-owned", /\.Shutdown\s*\(/, "Server shutdown is explicitly owned and drainable."),
         ...positive(file, "go-http.client-timeout", /http\.Client\s*\{[^}]*Timeout\s*:/s, "An HTTP client declares an explicit Timeout."),
         ...positive(file, "go-http.request-context", /\bhttp\.NewRequestWithContext\s*\(/, "Outbound requests carry a parent context."),
@@ -119,6 +128,128 @@ export const domain: DomainDefinition = {
     };
   },
 };
+
+/**
+ * Partition io.ReadAll by trust boundary. Do not call CLI stdin, local files, or
+ * full-artifact downloads "attacker-controlled request bodies".
+ */
+function readAllSignals(file: SourceRevision): Signal[] {
+  if (!/\bio\.ReadAll\s*\(/.test(file.current)) return [];
+  const signals: Signal[] = [];
+  const lines = file.current.split("\n");
+  lines.forEach((line, index) => {
+    const match = line.match(/\bio\.ReadAll\s*\(\s*([^)]*)\s*\)/);
+    if (match === null) return;
+    // Local limit already applied on this line or nearby assignment.
+    if (/\b(?:MaxBytesReader|LimitReader)\s*\(/.test(line)) return;
+    const arg = (match[1] ?? "").trim();
+    const surrounding = lines.slice(Math.max(0, index - 3), index + 3).join("\n");
+    const path = file.path.replaceAll("\\", "/");
+
+    // Class E-ish: skip under testdata / examples already excluded by includePath for _test.go.
+    if (/(^|\/)(?:testdata|fixtures)\//.test(path)) return;
+
+    // Class C: full product downloads / archives / checksums — do not recommend small limits.
+    if (isLargeArtifactDownload(arg, surrounding, path)) return;
+
+    // Class B / D: CLI stdin, local files, OCI/local store — not HTTP threat model.
+    if (isLocalOrCliInput(arg, surrounding, path)) return;
+
+    // Class A1: HTTP server handler request body.
+    if (isHandlerRequestBody(arg, surrounding)) {
+      signals.push({
+        ruleId: "go-http.handler-body-limit",
+        path: file.path,
+        line: index + 1,
+        message: "This handler fully buffers the HTTP request body without a size bound.",
+        snippet: line.trim().slice(0, 300),
+        data: { class: "handler-request-body", arg },
+      });
+      return;
+    }
+
+    // Class A2: HTTP client response body.
+    if (isClientResponseBody(arg, surrounding)) {
+      signals.push({
+        ruleId: "go-http.client-response-limit",
+        path: file.path,
+        line: index + 1,
+        message: "This client fully buffers an HTTP response body without a size class.",
+        snippet: line.trim().slice(0, 300),
+        data: { class: "client-response-body", arg },
+      });
+      return;
+    }
+
+    // Ambiguous ReadAll — prefer no medium/high finding.
+  });
+  return signals;
+}
+
+function isHandlerRequestBody(arg: string, surrounding: string): boolean {
+  if (/\br\.Body\b|\breq\.Body\b|\brequest\.Body\b/.test(arg)) return true;
+  if (/\b(?:r|req|request)\.Body\b/.test(arg)) return true;
+  // io.ReadAll(body) where body was r.Body nearby
+  if (/^\w+$/.test(arg) && new RegExp(`\\b${arg}\\s*:?=\\s*(?:r|req|request)\\.Body\\b`).test(surrounding)) {
+    return true;
+  }
+  return false;
+}
+
+function isClientResponseBody(arg: string, surrounding: string): boolean {
+  if (/\bresp(?:onse)?\.Body\b|\bres\.Body\b/.test(arg)) return true;
+  if (/^\w+$/.test(arg) && new RegExp(`\\b${arg}\\s*:?=\\s*resp(?:onse)?\\.Body\\b`).test(surrounding)) {
+    return true;
+  }
+  // Common: io.ReadAll(resp.Body) already covered; also http.Get result.
+  if (/\.Body\b/.test(arg) && /\b(?:http\.(?:Get|Post|Head|PostForm)|client\.Do|Client\.Do)\b/.test(surrounding)) {
+    return true;
+  }
+  return false;
+}
+
+function isLocalOrCliInput(arg: string, surrounding: string, path: string): boolean {
+  if (/\bos\.Stdin\b|\bstdin\b/i.test(arg)) return true;
+  if (/\bos\.Open\b|\bos\.ReadFile\b|\bos\.File\b|\bbytes\.NewReader\b|\bstrings\.NewReader\b|\bbytes\.Buffer\b/.test(arg + surrounding)) {
+    // Only when ReadAll argument is clearly the file/reader, not an HTTP body alias.
+    if (/\bBody\b/.test(arg)) return false;
+    if (/\bos\.Stdin\b|\bOpen\s*\(|ReadFile\s*\(/.test(arg) || /\b(?:f|file|r|reader|rc)\b/.test(arg)) {
+      // CLI / local path heuristics
+      if (/(^|\/)cli\//.test(path) || /(^|\/)cmd\//.test(path)) return true;
+      if (/\bos\.Stdin\b/.test(arg + surrounding)) return true;
+      if (/\bOpen\s*\(|ReadFile\s*\(|ioutil\.ReadFile/.test(surrounding) && !/\bBody\b/.test(arg)) return true;
+    }
+  }
+  // OCI / local store content (not HTTP).
+  if (/\bmanifest\b|\boci\b|\bblob\b|\blayer\b/i.test(arg + surrounding) && !/\bBody\b/.test(arg)) {
+    return true;
+  }
+  return false;
+}
+
+function isLargeArtifactDownload(arg: string, surrounding: string, path: string): boolean {
+  const blob = `${path}\n${arg}\n${surrounding}`;
+  if (/\b(?:download|downloader|checksum|archive|tarball|\.tar\.|gzip|binary|artifact|release asset)\b/i.test(blob)) {
+    // Still flag if it is clearly resp.Body of a small JSON token exchange — those say "token"/"json".
+    if (/\b(?:token|json|metadata|mmds)\b/i.test(blob) && /\bBody\b/.test(arg + surrounding) && !/\b(?:archive|tarball|binary|gzip)\b/i.test(blob)) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function gracefulShutdownSignals(file: SourceRevision): Signal[] {
+  if (!/\bListenAndServe\s*\(/.test(file.current)) return [];
+  if (/\.Shutdown\s*\(/.test(file.current)) return [];
+  // Short-lived test helpers already excluded via _test.go includePath.
+  return lineSignals(
+    file,
+    "go-http.graceful-shutdown",
+    /\b(?:http\.)?ListenAndServe\s*\(/,
+    () => "Server startup has no matching graceful shutdown path in this lifecycle.",
+  );
+}
 
 function clientNoTimeoutSignals(file: SourceRevision) {
   if (!/http\.Client\s*\{/.test(file.current)) return [];

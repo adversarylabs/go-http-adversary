@@ -18,10 +18,21 @@ const MAX_MODEL_OBSERVATIONS = 6;
 export const GO_HTTP_MODEL_PROMPT = `You are reviewing Go HTTP code for request boundaries, server lifecycle, and outbound client correctness.
 
 Authority:
-- server timeouts, body limits, graceful shutdown
+- server timeouts and graceful Shutdown (including long-lived local callback servers)
+- handler request bodies (r.Body) needing MaxBytesReader with a size class
+- client response bodies (resp.Body) needing LimitReader with a size class (token JSON vs metadata)
 - outbound http.Client timeouts and request contexts
 - DefaultClient / http.Get/Post without deadlines
-- auth header handling only when it creates a concrete HTTP contract risk
+
+Hard exclusions — do NOT file unbounded-body findings for:
+- CLI stdin / multi-MB YAML or manifest inputs (product must accept large legitimate input)
+- Full product downloads of archives/binaries/checksum streams
+- Local OCI store / file reads that are not HTTP
+- *_test.go noise
+
+Never label CLI stdin as an "attacker-controlled request body" unless it is an HTTP server handler.
+Severity by exposure: public handler > client to untrusted host > local trusted input (usually silence).
+When recommending limits, state a size class; do not invent a single tiny generic limit for release YAML or downloads.
 
 Do NOT review generic Go style, CLI UX, databases, or Kubernetes.
 Prefer silence over speculation. Zero to six observations. Cite only evidenceIds from the catalog.
@@ -72,6 +83,8 @@ export const GO_HTTP_MODEL_SCHEMA: Record<string, unknown> = {
             type: "string",
             enum: [
               "server-timeouts",
+              "handler-body-limit",
+              "client-response-limit",
               "body-limit",
               "graceful-shutdown",
               "client-timeout",
