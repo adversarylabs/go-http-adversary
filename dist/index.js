@@ -20596,17 +20596,21 @@ var IGNORED_DIRECTORIES = /* @__PURE__ */ new Set([
 ]);
 var MAX_FILE_BYTES = 75e4;
 var MAX_FILES = 750;
-async function discoverSources(repoPath) {
+async function discoverSources(repoPath, change) {
   if (!await isGitRepository(repoPath) || !await revisionExists(repoPath, "HEAD")) {
     return { mode: "repository", files: await readSources(repoPath, await repositoryFiles(repoPath)) };
   }
-  const worktree = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", "HEAD", "--"]);
-  if (worktree.trim() !== "") return diffDiscovery(repoPath, "HEAD", worktree);
-  const base = await chooseBase(repoPath);
-  if (base !== void 0) {
-    const names = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", base, "HEAD", "--"]);
-    if (names.trim() !== "") return diffDiscovery(repoPath, base, names);
+  if (change !== null && change.scanMode === "changed" && change.baseRef !== void 0 && await revisionExists(repoPath, change.baseRef)) {
+    const head = change.worktree ? [] : ["HEAD"];
+    const names = await gitOutput(
+      repoPath,
+      ["diff", "--name-status", "--find-renames", change.baseRef, ...head, "--"]
+    );
+    return diffDiscovery(repoPath, change.baseRef, names);
   }
+  return trackedRepository(repoPath);
+}
+async function trackedRepository(repoPath) {
   const paths = (await gitOutput(repoPath, ["ls-files", "-z"])).split("\0").filter((path) => domain.includePath(path)).slice(0, MAX_FILES);
   return { mode: "repository", files: await readSources(repoPath, paths) };
 }
@@ -20624,15 +20628,6 @@ async function diffDiscovery(repoPath, base, names) {
     });
   }
   return { mode: "diff", base, files };
-}
-async function chooseBase(repoPath) {
-  for (const candidate of ["origin/main", "origin/master", "main", "master"]) {
-    if (!await revisionExists(repoPath, candidate)) continue;
-    const mergeBase = (await gitOutput(repoPath, ["merge-base", "HEAD", candidate])).trim();
-    const head = (await gitOutput(repoPath, ["rev-parse", "HEAD"])).trim();
-    if (mergeBase !== "" && mergeBase !== head) return mergeBase;
-  }
-  return await revisionExists(repoPath, "HEAD^") ? "HEAD^" : void 0;
 }
 async function changedLineNumbers(repoPath, base, path) {
   const patch = await gitOutput(repoPath, ["diff", "--unified=0", base, "--", path]);
@@ -21110,11 +21105,11 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.3",
+    version: "0.0.4",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {
-    const discovery = await discoverSources(ctx.repoPath);
+    const discovery = await discoverSources(ctx.repoPath, ctx.change);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
     if (analysis.parseErrors.length > 0) {
