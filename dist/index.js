@@ -20582,7 +20582,7 @@ function byLocation(left, right) {
 // src/discover.ts
 import { execFile } from "node:child_process";
 import { readFile as readFile2, readdir as readdir2 } from "node:fs/promises";
-import { join as join2, relative as relative2, sep } from "node:path";
+import { join as join2, sep } from "node:path";
 import { promisify } from "node:util";
 var execute = promisify(execFile);
 var IGNORED_DIRECTORIES = /* @__PURE__ */ new Set([
@@ -20600,6 +20600,9 @@ async function discoverSources(repoPath, change) {
   if (!await isGitRepository(repoPath) || !await revisionExists(repoPath, "HEAD")) {
     return { mode: "repository", files: await readSources(repoPath, await repositoryFiles(repoPath)) };
   }
+  if (change !== null && change.scanMode === "all") {
+    return trackedRepository(repoPath);
+  }
   if (change !== null && change.scanMode === "changed" && change.baseRef !== void 0 && await revisionExists(repoPath, change.baseRef)) {
     const head = change.worktree ? [] : ["HEAD"];
     const names = await gitOutput(
@@ -20607,6 +20610,13 @@ async function discoverSources(repoPath, change) {
       ["diff", "--name-status", "--find-renames", change.baseRef, ...head, "--"]
     );
     return diffDiscovery(repoPath, change.baseRef, names);
+  }
+  const worktree = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", "HEAD", "--"]);
+  if (worktree.trim() !== "") return diffDiscovery(repoPath, "HEAD", worktree);
+  const base = await chooseBase(repoPath);
+  if (base !== void 0) {
+    const names = await gitOutput(repoPath, ["diff", "--name-status", "--find-renames", base, "HEAD", "--"]);
+    if (names.trim() !== "") return diffDiscovery(repoPath, base, names);
   }
   return trackedRepository(repoPath);
 }
@@ -20629,81 +20639,113 @@ async function diffDiscovery(repoPath, base, names) {
   }
   return { mode: "diff", base, files };
 }
-async function changedLineNumbers(repoPath, base, path) {
-  const patch = await gitOutput(repoPath, ["diff", "--unified=0", base, "--", path]);
-  const lines = /* @__PURE__ */ new Set();
-  for (const match of patch.matchAll(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm)) {
-    const start2 = Number(match[1]);
-    const count = match[2] === void 0 ? 1 : Number(match[2]);
-    for (let line = start2; line < start2 + count; line += 1) lines.add(line);
-  }
-  return lines;
-}
-async function repositoryFiles(repoPath) {
-  const result = [];
-  async function walk2(directory) {
-    if (result.length >= MAX_FILES) return;
-    const entries = await readdir2(directory, { withFileTypes: true });
-    entries.sort((left, right) => left.name.localeCompare(right.name));
-    for (const entry of entries) {
-      if (result.length >= MAX_FILES || entry.isSymbolicLink()) continue;
-      const absolute = join2(directory, entry.name);
-      if (entry.isDirectory()) {
-        if (!IGNORED_DIRECTORIES.has(entry.name)) await walk2(absolute);
-      } else {
-        const path = relative2(repoPath, absolute).split(sep).join("/");
-        if (domain.includePath(path)) result.push(path);
-      }
-    }
-  }
-  await walk2(repoPath);
-  return result;
-}
 async function readSources(repoPath, paths) {
   const files = [];
   for (const path of paths) {
     const current = await safeRead(join2(repoPath, path));
-    if (current !== void 0) files.push({ path, current, changedLines: /* @__PURE__ */ new Set(), status: "repository" });
+    if (current === void 0) continue;
+    files.push({ path, current, changedLines: /* @__PURE__ */ new Set(), status: "repository" });
   }
   return files;
 }
-async function safeRead(path) {
-  try {
-    const content = await readFile2(path);
-    if (content.byteLength > MAX_FILE_BYTES || content.includes(0)) return void 0;
-    return content.toString("utf8");
-  } catch {
-    return void 0;
+async function repositoryFiles(repoPath) {
+  const files = [];
+  async function visit(directory) {
+    if (files.length >= MAX_FILES) return;
+    let entries;
+    try {
+      entries = await readdir2(join2(repoPath, directory), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      if (files.length >= MAX_FILES) return;
+      const relativePath = directory === "" ? entry.name : join2(directory, entry.name);
+      const posix = relativePath.split(sep).join("/");
+      if (entry.isDirectory()) {
+        if (!IGNORED_DIRECTORIES.has(entry.name)) await visit(posix);
+        continue;
+      }
+      if (domain.includePath(posix)) files.push(posix);
+    }
   }
+  await visit("");
+  return files;
 }
-async function revisionExists(repoPath, revision) {
+async function changedLineNumbers(repoPath, base, path) {
+  const lines = /* @__PURE__ */ new Set();
   try {
-    await execute("git", ["-C", repoPath, "rev-parse", "--verify", "--quiet", revision]);
+    const patch = await gitOutput(repoPath, ["diff", "--unified=0", base, "--", path]);
+    let newLine = 0;
+    for (const line of patch.split("\n")) {
+      const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+      if (header) {
+        newLine = Number(header[1]);
+        continue;
+      }
+      if (line.startsWith("+") && !line.startsWith("+++")) {
+        lines.add(newLine);
+        newLine += 1;
+      } else if (line.startsWith("-") && !line.startsWith("---")) {
+      } else if (!line.startsWith("\\")) {
+        newLine += 1;
+      }
+    }
+  } catch {
+  }
+  return lines;
+}
+function parseNameStatus(names) {
+  return names.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => {
+    const parts2 = line.split("	");
+    const status = (parts2[0] ?? "M")[0] ?? "M";
+    const path = parts2.length > 2 ? parts2[2] : parts2[1] ?? "";
+    return { status, path };
+  }).filter((record) => record.path.length > 0);
+}
+async function chooseBase(repoPath) {
+  for (const candidate of ["main", "master", "trunk", "origin/main", "origin/master"]) {
+    if (await revisionExists(repoPath, candidate)) {
+      const head = await gitOutput(repoPath, ["rev-parse", "HEAD"]);
+      const base = await gitOutput(repoPath, ["rev-parse", candidate]);
+      if (head.trim() !== base.trim()) return candidate;
+    }
+  }
+  return void 0;
+}
+async function isGitRepository(repoPath) {
+  try {
+    await gitOutput(repoPath, ["rev-parse", "--is-inside-work-tree"]);
     return true;
   } catch {
     return false;
   }
 }
-async function isGitRepository(repoPath) {
+async function revisionExists(repoPath, rev) {
   try {
-    return (await gitOutput(repoPath, ["rev-parse", "--is-inside-work-tree"])).trim() === "true";
+    await gitOutput(repoPath, ["rev-parse", "--verify", rev]);
+    return true;
   } catch {
     return false;
   }
 }
 async function gitOutput(repoPath, args2) {
   const { stdout } = await execute("git", ["-C", repoPath, ...args2], {
-    encoding: "utf8",
-    maxBuffer: 16 * 1024 * 1024
+    maxBuffer: 20 * 1024 * 1024,
+    encoding: "utf8"
   });
   return stdout;
 }
-function parseNameStatus(output) {
-  return output.split("\n").filter(Boolean).map((line) => {
-    const fields = line.split("	");
-    const status = fields[0]?.slice(0, 1) ?? "";
-    return { status, path: (status === "R" || status === "C" ? fields[2] : fields[1]) ?? "" };
-  });
+async function safeRead(path) {
+  try {
+    const buffer = await readFile2(path);
+    if (buffer.byteLength > MAX_FILE_BYTES) return void 0;
+    if (buffer.includes(0)) return void 0;
+    return buffer.toString("utf8");
+  } catch {
+    return void 0;
+  }
 }
 
 // src/model-review.ts
@@ -21105,7 +21147,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.4",
+    version: "0.0.5",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {
