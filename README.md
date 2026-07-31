@@ -15,3 +15,7 @@ Five graded fixtures own expected review snapshots. The 61-repository corpus cal
 ## Development
 
 Run `npm test`, `adversary validate .`, and `adversary pack --check .`.
+
+## Issue catalog
+
+What this adversary targets (P0 / P1 / LLM-only priorities, detection notes, and public pattern references) is documented in [docs/issue-catalog.md](docs/issue-catalog.md).
