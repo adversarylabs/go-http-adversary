@@ -1,6 +1,7 @@
 import { formatOpinion, requireOpinionConcern, type RuleContext } from "@adversarylabs/sdk";
 import { domain } from "./domain.js";
 import { runModelHttpReview, type DiscoveryFile } from "./model-review.js";
+import { attachImportNavigation } from "./navigation.js";
 import { type Analysis, type RuleDefinition, type Signal } from "./types.js";
 
 const RISK_ORDER = { none: 0, low: 1, medium: 2, high: 3, critical: 4 } as const;
@@ -56,6 +57,8 @@ export async function reviewDomain(
 
   const staticSeverities = active.map((item) => item.rule.severity);
   const staticPrimaryConcern = active[0]?.rule.concern ?? active[0]?.rule.title.toLowerCase();
+  await attachImportNavigation(ctx, analysis);
+
   const modelStatus = await runModelHttpReview(
     ctx,
     analysis,
