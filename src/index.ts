@@ -16,7 +16,7 @@ export function createApp(): Adversary {
   });
 
   app.rule(`${domain.name}.review`, async (ctx) => {
-    const discovery = await discoverSources(ctx.repoPath, ctx.change);
+    const discovery = await discoverSources(ctx);
     const analysis = await analyzeDiscovery(discovery);
     ctx.summary.files_scanned = analysis.filesScanned;
     if (analysis.parseErrors.length > 0) {
