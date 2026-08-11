@@ -112,3 +112,13 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Looks for** | `http.Get`/`Post`/`Head`/`PostForm` |
 | **Stays quiet when** | Owned client with Timeout |
 | **Remediation** | Prefer explicit clients |
+
+### `go-http.response-writer-capabilities`
+
+| | |
+| --- | --- |
+| **What** | A transparent `http.ResponseWriter` wrapper claims to preserve `Flusher` or `Hijacker`, but relies only on `Unwrap`/`ResponseController` and does not declare the corresponding methods |
+| **Why** | Existing middleware often uses direct `w.(http.Flusher)` and `w.(http.Hijacker)` assertions, which do not follow `Unwrap` |
+| **Looks for** | A changed, explicit capability-preservation claim beside a writer wrapper, named optional interfaces, and missing `Flush`/`Hijack` methods |
+| **Stays quiet when** | Direct methods are declared; the wrapper intentionally reduces capabilities and makes no preservation claim; an ordinary recorder has no transparent-compatibility contract |
+| **Remediation** | Implement the claimed methods with wrapper-appropriate semantics and test both direct assertions and `http.ResponseController` |
