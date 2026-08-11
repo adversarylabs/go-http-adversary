@@ -129,6 +129,22 @@ export const domain: DomainDefinition = {
       impact: "Malicious sites can invoke credentialed APIs.",
       recommendation: "Use explicit origin allowlists; never combine * with credentials.",
     },
+    {
+      id: "go-http.response-writer-capabilities",
+      title: "A transparent ResponseWriter wrapper drops claimed interfaces",
+      concern: "loss of HTTP ResponseWriter capabilities in middleware wrappers",
+      category: "compatibility",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) =>
+        `${count} ResponseWriter wrapper${count === 1 ? " does" : "s do"} not preserve the optional interfaces claimed in source.`,
+      whyItMatters:
+        "ResponseController follows Unwrap, but existing middleware commonly uses direct http.Flusher and http.Hijacker type assertions.",
+      impact:
+        "Wrapping the writer can silently disable streaming, connection upgrades, or other established provider behavior.",
+      recommendation:
+        "Declare the claimed optional interface methods on the wrapper and preserve their intended semantics, then test both direct assertions and ResponseController.",
+    },
   ],
   noRiskSummary: "The reviewed HTTP boundaries include bounded input, server timing, graceful lifecycle ownership, and outbound deadlines.",
   approvalSummary: "I would approve the reviewed HTTP request, client, and server lifecycle.",
