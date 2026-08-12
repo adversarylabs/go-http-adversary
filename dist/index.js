@@ -21471,27 +21471,40 @@ function clientResponseBodyCloseSignals(file, root) {
     const body2 = fn.childForFieldName("body");
     if (body2 === null) continue;
     const bodyText = sourceText(body2, file.current);
-    const acquisitions = clientResponseAcquisitions(bodyText, body2.startPosition.row + 1);
+    const lexicalBody = maskGoLexicalNoise(body2, file.current);
+    const acquisitions = clientResponseAcquisitions(lexicalBody, body2.startPosition.row + 1);
     for (const acquisition of acquisitions) {
       const name2 = escapeRegExp(acquisition.name);
-      if (new RegExp(`\\b${name2}\\s*\\.\\s*Body\\s*\\.\\s*Close\\s*\\(`).test(bodyText)) continue;
-      if (bodyTransfersOwnership(bodyText, name2)) continue;
-      if (bodyUsesCloseHelper(bodyText, name2)) continue;
-      const consumption = firstResponseBodyConsumption(bodyText, name2);
+      if (new RegExp(`\\b${name2}\\s*\\.\\s*Body\\s*\\.\\s*Close\\s*\\(`).test(lexicalBody)) continue;
+      if (bodyTransfersOwnership(lexicalBody, name2)) continue;
+      if (bodyUsesCloseHelper(lexicalBody, name2)) continue;
+      const consumption = firstResponseBodyConsumption(lexicalBody, name2);
       if (consumption === void 0) continue;
-      const line = body2.startPosition.row + 1 + bodyText.slice(0, consumption.index).split("\n").length - 1;
+      const line = body2.startPosition.row + 1 + lexicalBody.slice(0, consumption.index).split("\n").length - 1;
       if (!changed(file, acquisition.line, line)) continue;
       signals.push({
         ruleId: "go-http.client-response-body-close",
         path: file.path,
         line,
         message: `${acquisition.name}.Body is consumed in this function without being closed or returned to an owner.`,
-        snippet: consumption.text.trim().slice(0, 300),
+        snippet: bodyText.slice(consumption.index, consumption.index + consumption.text.length).trim().slice(0, 300),
         data: { response: acquisition.name, acquisitionLine: acquisition.line, consumer: consumption.consumer }
       });
     }
   }
   return signals;
+}
+function maskGoLexicalNoise(container, source) {
+  const text = sourceText(container, source);
+  const nodes = ["comment", "interpreted_string_literal", "raw_string_literal", "rune_literal"].flatMap((type) => descendants(container, type)).sort((left, right) => right.startIndex - left.startIndex);
+  let masked = text;
+  for (const node of nodes) {
+    const start2 = node.startIndex - container.startIndex;
+    const end = node.endIndex - container.startIndex;
+    const replacement = masked.slice(start2, end).replace(/[^\r\n]/g, " ");
+    masked = masked.slice(0, start2) + replacement + masked.slice(end);
+  }
+  return masked;
 }
 function clientResponseAcquisitions(body2, bodyStartLine) {
   const acquisitions = [];

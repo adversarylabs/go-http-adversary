@@ -55,17 +55,18 @@ function clientResponseBodyCloseSignals(file: SourceRevision, root: Node): Signa
     const body = fn.childForFieldName("body");
     if (body === null) continue;
     const bodyText = sourceText(body, file.current);
-    const acquisitions = clientResponseAcquisitions(bodyText, body.startPosition.row + 1);
+    const lexicalBody = maskGoLexicalNoise(body, file.current);
+    const acquisitions = clientResponseAcquisitions(lexicalBody, body.startPosition.row + 1);
 
     for (const acquisition of acquisitions) {
       const name = escapeRegExp(acquisition.name);
-      if (new RegExp(`\\b${name}\\s*\\.\\s*Body\\s*\\.\\s*Close\\s*\\(`).test(bodyText)) continue;
-      if (bodyTransfersOwnership(bodyText, name)) continue;
-      if (bodyUsesCloseHelper(bodyText, name)) continue;
+      if (new RegExp(`\\b${name}\\s*\\.\\s*Body\\s*\\.\\s*Close\\s*\\(`).test(lexicalBody)) continue;
+      if (bodyTransfersOwnership(lexicalBody, name)) continue;
+      if (bodyUsesCloseHelper(lexicalBody, name)) continue;
 
-      const consumption = firstResponseBodyConsumption(bodyText, name);
+      const consumption = firstResponseBodyConsumption(lexicalBody, name);
       if (consumption === undefined) continue;
-      const line = body.startPosition.row + 1 + bodyText.slice(0, consumption.index).split("\n").length - 1;
+      const line = body.startPosition.row + 1 + lexicalBody.slice(0, consumption.index).split("\n").length - 1;
       if (!changed(file, acquisition.line, line)) continue;
 
       signals.push({
@@ -73,12 +74,27 @@ function clientResponseBodyCloseSignals(file: SourceRevision, root: Node): Signa
         path: file.path,
         line,
         message: `${acquisition.name}.Body is consumed in this function without being closed or returned to an owner.`,
-        snippet: consumption.text.trim().slice(0, 300),
+        snippet: bodyText.slice(consumption.index, consumption.index + consumption.text.length).trim().slice(0, 300),
         data: { response: acquisition.name, acquisitionLine: acquisition.line, consumer: consumption.consumer },
       });
     }
   }
   return signals;
+}
+
+function maskGoLexicalNoise(container: Node, source: string): string {
+  const text = sourceText(container, source);
+  const nodes = ["comment", "interpreted_string_literal", "raw_string_literal", "rune_literal"]
+    .flatMap((type) => descendants(container, type))
+    .sort((left, right) => right.startIndex - left.startIndex);
+  let masked = text;
+  for (const node of nodes) {
+    const start = node.startIndex - container.startIndex;
+    const end = node.endIndex - container.startIndex;
+    const replacement = masked.slice(start, end).replace(/[^\r\n]/g, " ");
+    masked = masked.slice(0, start) + replacement + masked.slice(end);
+  }
+  return masked;
 }
 
 function clientResponseAcquisitions(body: string, bodyStartLine: number): ClientResponseAcquisition[] {
