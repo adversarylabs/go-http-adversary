@@ -76,14 +76,14 @@ func fetch(client *http.Client) error {
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false, JSON.stringify(output.findings, null, 2));
 });
 
-test("does not mistake an unrelated Do method for an HTTP response", async () => {
+test("does not mistake an unrelated c.Do method for an HTTP response", async () => {
   const output = await review(`package worker
-import "io"
+import ("io"; "net/http")
 type result struct { Body io.Reader }
-type worker struct{}
-func (worker) Do() (*result, error) { return nil, nil }
-func run(w worker) error {
-	resp, err := w.Do()
+type coordinator struct { fallback *http.Client }
+func (coordinator) Do() (*result, error) { return nil, nil }
+func run(c coordinator) error {
+	resp, err := c.Do()
 	if err != nil { return err }
 	_, err = io.ReadAll(resp.Body)
 	return err
