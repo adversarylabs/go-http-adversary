@@ -15,6 +15,7 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
           signals.push(...responseWriterCapabilitySignals(file, tree.rootNode));
+          signals.push(...clientResponseBodyCloseSignals(file, tree.rootNode));
         } finally {
           tree.delete();
         }
@@ -35,6 +36,104 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path)),
   };
+}
+
+interface ClientResponseAcquisition {
+  name: string;
+  line: number;
+}
+
+function clientResponseBodyCloseSignals(file: SourceRevision, root: Node): Signal[] {
+  const signals: Signal[] = [];
+  const functions = [
+    ...descendants(root, "function_declaration"),
+    ...descendants(root, "method_declaration"),
+    ...descendants(root, "func_literal"),
+  ];
+
+  for (const fn of functions) {
+    const body = fn.childForFieldName("body");
+    if (body === null) continue;
+    const bodyText = sourceText(body, file.current);
+    const acquisitions = clientResponseAcquisitions(bodyText, body.startPosition.row + 1);
+
+    for (const acquisition of acquisitions) {
+      const name = escapeRegExp(acquisition.name);
+      if (new RegExp(`\\b${name}\\s*\\.\\s*Body\\s*\\.\\s*Close\\s*\\(`).test(bodyText)) continue;
+      if (bodyTransfersOwnership(bodyText, name)) continue;
+      if (bodyUsesCloseHelper(bodyText, name)) continue;
+
+      const consumption = firstResponseBodyConsumption(bodyText, name);
+      if (consumption === undefined) continue;
+      const line = body.startPosition.row + 1 + bodyText.slice(0, consumption.index).split("\n").length - 1;
+      if (!changed(file, acquisition.line, line)) continue;
+
+      signals.push({
+        ruleId: "go-http.client-response-body-close",
+        path: file.path,
+        line,
+        message: `${acquisition.name}.Body is consumed in this function without being closed or returned to an owner.`,
+        snippet: consumption.text.trim().slice(0, 300),
+        data: { response: acquisition.name, acquisitionLine: acquisition.line, consumer: consumption.consumer },
+      });
+    }
+  }
+  return signals;
+}
+
+function clientResponseAcquisitions(body: string, bodyStartLine: number): ClientResponseAcquisition[] {
+  const acquisitions: ClientResponseAcquisition[] = [];
+  const assignment = /\b([A-Za-z_]\w*)\s*(?:,\s*[A-Za-z_]\w*)?\s*:?=\s*(?:http\.(?:Get|Post|Head|PostForm)|(?:[A-Za-z_]\w*\.)*(?:client|httpClient|httpclient|DefaultClient|hc)\.(?:Do|Get|Post|Head|PostForm)|(?:[A-Za-z_]\w*\.)*(?:transport|roundTripper|roundtripper|rt)\.RoundTrip)\s*\(/g;
+  let match: RegExpExecArray | null;
+  while ((match = assignment.exec(body)) !== null) {
+    const name = match[1];
+    if (name === undefined || name === "_") continue;
+    acquisitions.push({
+      name,
+      line: bodyStartLine + body.slice(0, match.index).split("\n").length - 1,
+    });
+  }
+  return acquisitions;
+}
+
+function firstResponseBodyConsumption(
+  body: string,
+  responseName: string,
+): { index: number; text: string; consumer: string } | undefined {
+  const responseBody = `${responseName}\\s*\\.\\s*Body`;
+  const consumers: Array<{ name: string; pattern: RegExp }> = [
+    { name: "ReadAll", pattern: new RegExp(`\\b(?:io|ioutil)\\.ReadAll\\s*\\(\\s*${responseBody}\\b`) },
+    { name: "Decode", pattern: new RegExp(`\\b(?:json|xml)\\.NewDecoder\\s*\\(\\s*${responseBody}\\s*\\)\\s*\\.\\s*Decode\\s*\\(`) },
+    { name: "Copy", pattern: new RegExp(`\\bio\\.(?:Copy|CopyBuffer)\\s*\\([^\\n,]+,\\s*${responseBody}\\b`) },
+  ];
+  let first: { index: number; text: string; consumer: string } | undefined;
+  for (const consumer of consumers) {
+    const match = consumer.pattern.exec(body);
+    if (match === null || (first !== undefined && first.index <= match.index)) continue;
+    first = { index: match.index, text: match[0], consumer: consumer.name };
+  }
+  return first;
+}
+
+function bodyTransfersOwnership(body: string, responseName: string): boolean {
+  return body.split("\n").some((line) => {
+    const returned = line.match(/\breturn\s+(.+)$/)?.[1];
+    if (returned === undefined) return false;
+    return returned.split(",").some((expression) =>
+      new RegExp(`^\\s*${responseName}\\s*$`).test(expression.replace(/\/\/.*$/, "")),
+    );
+  });
+}
+
+function bodyUsesCloseHelper(body: string, responseName: string): boolean {
+  const calls = body.matchAll(/\b([A-Za-z_]\w*)\s*\(([^)\n]*)\)/g);
+  for (const call of calls) {
+    const name = call[1] ?? "";
+    const args = call[2] ?? "";
+    if (!/(?:close|cleanup|release|discard)/i.test(name)) continue;
+    if (new RegExp(`\\b${responseName}\\b`).test(args)) return true;
+  }
+  return false;
 }
 
 interface CapabilityClaim {
