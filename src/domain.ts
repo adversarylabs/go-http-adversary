@@ -45,6 +45,21 @@ export const domain: DomainDefinition = {
       recommendation: "Read with io.LimitReader using a size class (token JSON vs metadata vs small asset), not an unbounded io.ReadAll.",
     },
     {
+      id: "go-http.client-response-body-close",
+      title: "A consumed HTTP response body is not closed",
+      concern: "consumed HTTP client response bodies without an owning close",
+      category: "reliability",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) => `${count} consumed HTTP response bod${count === 1 ? "y is" : "ies are"} not closed by its owner.`,
+      whyItMatters:
+        "Successful HTTP client responses own a body whose close releases transport resources and completes lifecycle hooks.",
+      impact:
+        "Repeated requests can retain sockets or other transport state and can prevent tracing or finalization work from completing.",
+      recommendation:
+        "After checking the request error, defer response.Body.Close before consuming the body; if the response is returned, make that ownership transfer explicit.",
+    },
+    {
       id: "go-http.graceful-shutdown",
       title: "The server lifecycle has no graceful shutdown path",
       concern: "HTTP servers without graceful shutdown",
