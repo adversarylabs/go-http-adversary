@@ -92,6 +92,45 @@ func run(c coordinator) error {
   assert.equal(output.findings.some((item) => item.ruleId === ruleId), false, JSON.stringify(output.findings, null, 2));
 });
 
+test("comments and strings cannot fake a response close or ownership return", async () => {
+  const output = await review(`package client
+import ("io"; "net/http")
+func comments(client *http.Client, req *http.Request) error {
+	resp, err := client.Do(req)
+	if err != nil { return err }
+	// TODO: resp.Body.Close()
+	// someday return resp
+	_, err = io.ReadAll(resp.Body)
+	return err
+}
+func strings(client *http.Client, req *http.Request) error {
+	resp, err := client.Do(req)
+	if err != nil { return err }
+	_ = "resp.Body.Close()"
+	_ = \`resp.Body.Close()
+return resp\`
+	_, err = io.ReadAll(resp.Body)
+	return err
+}
+`);
+  const finding = output.findings.find((item) => item.ruleId === ruleId);
+  assert.ok(finding, JSON.stringify(output.findings, null, 2));
+  assert.deepEqual(finding.evidence.map((item) => item.location?.line), [8, 17]);
+});
+
+test("comments and strings cannot fabricate an HTTP response acquisition", async () => {
+  const output = await review(`package client
+import ("io"; "net/http")
+func consume(resp *http.Response) error {
+	// resp, err := client.Do(req)
+	_ = "resp, err := http.Get(url)"
+	_, err := io.ReadAll(resp.Body)
+	return err
+}
+`);
+  assert.equal(output.findings.some((item) => item.ruleId === ruleId), false, JSON.stringify(output.findings, null, 2));
+});
+
 test("diff mode requires the acquisition-to-consumption span to change", async () => {
   const current = `package client
 import ("encoding/json"; "net/http")
