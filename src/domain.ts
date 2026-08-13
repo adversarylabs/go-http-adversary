@@ -45,6 +45,22 @@ export const domain: DomainDefinition = {
       recommendation: "Read with io.LimitReader using a size class (token JSON vs metadata vs small asset), not an unbounded io.ReadAll.",
     },
     {
+      id: "go-http.provider-response-buffer-limit",
+      title: "A provider response wrapper buffers callback output without a limit",
+      concern: "unbounded provider or downstream HTTP response buffering",
+      category: "reliability",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) =>
+        `${count} ResponseWriter substitute${count === 1 ? "" : "s"} accumulate callback-controlled output without a proven bound.`,
+      whyItMatters:
+        "A provider, plugin, or downstream handler controls how much it writes; staging that output transfers its memory risk into the intermediary.",
+      impact:
+        "A buggy or adversarial callback can grow the process heap until the request or process fails.",
+      recommendation:
+        "Establish a response-size class and enforce a hard cap, or use streaming/backpressure or spill-to-disk when the output is legitimately large.",
+    },
+    {
       id: "go-http.client-response-body-close",
       title: "A consumed HTTP response body is not closed",
       concern: "consumed HTTP client response bodies without an owning close",

@@ -12,7 +12,7 @@ Review Go HTTP servers/clients for bounded requests, safe middleware, and produc
 
 ## In scope (fair miss if humans raised it and we did not)
 
-- Missing timeouts, unbounded bodies
+- Missing timeouts, unbounded request/client bodies, and unbounded buffering of provider or downstream HTTP response output
 - Middleware ordering / panic recovery gaps
 - Server shutdown / lifecycle mistakes
 - Unsafe client reuse or per-request clients in hot paths when relevant to HTTP
