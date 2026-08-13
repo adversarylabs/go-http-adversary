@@ -83,6 +83,16 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Stays quiet when** | io.LimitReader with size class |
 | **Remediation** | Bound response reads |
 
+### `go-http.provider-response-buffer-limit`
+
+| | |
+| --- | --- |
+| **What** | A production `http.ResponseWriter` substitute accumulates body data written by a provider, plugin, or downstream callback without a proven bound |
+| **Why** | The callback controls output volume, so the intermediary can grow the process heap until failure |
+| **Looks for** | A ResponseWriter-shaped type with a `bytes.Buffer`-backed `Write`, instantiated and passed across a provider/downstream callback boundary |
+| **Stays quiet when** | The writer enforces a hard cap, the prepared source establishes an upstream maximum, output is streamed/backpressured or spilled, the recorder is internal/test-only, or no callback boundary is proven |
+| **Remediation** | Enforce an endpoint-appropriate response cap or use streaming/backpressure/spill-to-disk for legitimately large output |
+
 ### `go-http.graceful-shutdown`
 
 | | |

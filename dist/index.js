@@ -17144,6 +17144,18 @@ var domain = {
       recommendation: "Read with io.LimitReader using a size class (token JSON vs metadata vs small asset), not an unbounded io.ReadAll."
     },
     {
+      id: "go-http.provider-response-buffer-limit",
+      title: "A provider response wrapper buffers callback output without a limit",
+      concern: "unbounded provider or downstream HTTP response buffering",
+      category: "reliability",
+      severity: "medium",
+      confidence: "high",
+      summary: (count) => `${count} ResponseWriter substitute${count === 1 ? "" : "s"} accumulate callback-controlled output without a proven bound.`,
+      whyItMatters: "A provider, plugin, or downstream handler controls how much it writes; staging that output transfers its memory risk into the intermediary.",
+      impact: "A buggy or adversarial callback can grow the process heap until the request or process fails.",
+      recommendation: "Establish a response-size class and enforce a hard cap, or use streaming/backpressure or spill-to-disk when the output is legitimately large."
+    },
+    {
       id: "go-http.client-response-body-close",
       title: "A consumed HTTP response body is not closed",
       concern: "consumed HTTP client response bodies without an owning close",
@@ -21459,6 +21471,7 @@ async function analyzeDiscovery(discovery) {
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
           signals.push(...responseWriterCapabilitySignals(file, tree.rootNode));
+          signals.push(...providerResponseBufferSignals(file, tree.rootNode));
           signals.push(...clientResponseBodyCloseSignals(file, tree.rootNode));
         } finally {
           tree.delete();
@@ -21479,6 +21492,386 @@ async function analyzeDiscovery(discovery) {
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path))
   };
+}
+function providerResponseBufferSignals(file, root) {
+  const lexicalFile = maskGoLexicalNoise(root, file.current);
+  const methods = descendants(root, "method_declaration");
+  const bytesAliases = standardImportAliases(root, file.current, "bytes", "bytes");
+  const httpAliases = standardImportAliases(root, file.current, "net/http", "http");
+  const signals = [];
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const nameNode = typeSpec.childForFieldName("name");
+    const typeNode = typeSpec.childForFieldName("type");
+    if (nameNode === null || typeNode?.type !== "struct_type") continue;
+    const typeName = sourceText(nameNode, file.current);
+    const bufferDeclarations = descendants(typeNode, "field_declaration").flatMap((field) => {
+      const text = sourceText(field, file.current);
+      const fields = [...bytesAliases].flatMap((alias) => {
+        const match = new RegExp(
+          `^\\s*([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*)\\s+${escapeRegExp(alias)}\\s*\\.\\s*Buffer\\b`
+        ).exec(text);
+        return match?.[1]?.split(",").map((name2) => name2.trim()).filter(Boolean) ?? [];
+      });
+      return fields.map((name2) => ({ node: field, name: name2 }));
+    });
+    if (bufferDeclarations.length === 0) continue;
+    const typeMethods = methods.filter((method) => {
+      const receiver = method.childForFieldName("receiver");
+      return receiver !== null && new RegExp(`\\b${escapeRegExp(typeName)}\\b`).test(sourceText(receiver, file.current));
+    });
+    if (!implementsResponseWriter(typeMethods, file.current, httpAliases)) continue;
+    const writeMethod = typeMethods.find((method) => {
+      const name2 = method.childForFieldName("name");
+      return name2 !== null && sourceText(name2, file.current) === "Write";
+    });
+    if (writeMethod === void 0) continue;
+    const writeBody = writeMethod.childForFieldName("body");
+    if (writeBody === null) continue;
+    const writeReceiver = methodReceiverName(writeMethod, file.current);
+    if (writeReceiver === void 0) continue;
+    const writeInput = sourceText(writeMethod, file.current).match(/\bWrite\s*\(\s*([A-Za-z_]\w*)\s+\[\s*\]\s*byte\b/)?.[1];
+    if (writeInput === void 0) continue;
+    const accumulatingWrites = descendants(writeBody, "call_expression").flatMap((call) => {
+      const fn = call.childForFieldName("function");
+      const argumentsNode = call.childForFieldName("arguments");
+      if (fn?.type !== "selector_expression" || argumentsNode === null) return [];
+      const expression = sourceText(fn, file.current).replace(/\s/g, "");
+      const declaration = bufferDeclarations.find(({ name: name2 }) => expression === `${writeReceiver}.${name2}.Write`);
+      const argument = argumentsNode.namedChildren.length === 1 ? sourceText(argumentsNode.namedChildren[0], file.current).trim() : "";
+      return declaration === void 0 || argument !== writeInput ? [] : [{ call, declaration }];
+    });
+    const uses = responseWriterCallbackUses(root, lexicalFile, file.current, typeName, httpAliases);
+    for (const { call: writeCall, declaration } of accumulatingWrites) {
+      const bufferField = declaration.name;
+      if (writeHasProvenBound(writeMethod, writeCall, file.current, writeReceiver, bufferField)) continue;
+      for (const use of uses) {
+        const writeLine = writeCall.startPosition.row + 1;
+        const bufferLine = declaration.node.startPosition.row + 1;
+        const typeLine = typeSpec.startPosition.row + 1;
+        const changedEvidence = [
+          { line: writeLine, snippet: sourceText(writeCall, file.current).trim() },
+          { line: bufferLine, snippet: sourceText(declaration.node, file.current).trim() },
+          ...use.relationships.map((node) => ({
+            line: node.startPosition.row + 1,
+            snippet: sourceText(node, file.current).trim()
+          })),
+          { line: use.line, snippet: sourceText(use.node, file.current).trim() }
+        ].find((evidence) => changed(file, evidence.line));
+        if (changedEvidence === void 0) continue;
+        signals.push({
+          ruleId: "go-http.provider-response-buffer-limit",
+          path: file.path,
+          line: changedEvidence.line,
+          message: `${typeName} accumulates body data written by ${use.method} into ${bufferField} without a proven cap, streaming/backpressure, or spill strategy.`,
+          snippet: changedEvidence.snippet.slice(0, 300),
+          data: {
+            wrapper: typeName,
+            bufferField,
+            bufferLine,
+            writeLine,
+            callbackVariable: use.variable,
+            callbackMethod: use.method,
+            callbackLine: use.line,
+            relationshipLines: use.relationships.map((node) => node.startPosition.row + 1),
+            typeLine
+          }
+        });
+      }
+    }
+  }
+  return signals;
+}
+function standardImportAliases(root, source, path, defaultAlias) {
+  const aliases = /* @__PURE__ */ new Set();
+  for (const spec of descendants(root, "import_spec")) {
+    const text = sourceText(spec, source).trim();
+    const match = /^(?:([A-Za-z_]\w*)\s+)?["`]([^"`]+)["`]$/.exec(text);
+    if (match?.[2] !== path) continue;
+    const alias = match[1] ?? defaultAlias;
+    if (alias !== "_" && alias !== ".") aliases.add(alias);
+  }
+  return aliases;
+}
+function implementsResponseWriter(methods, source, httpAliases) {
+  const compactSignatures = /* @__PURE__ */ new Map();
+  for (const method of methods) {
+    const name2 = method.childForFieldName("name");
+    if (name2 === null) continue;
+    const body2 = method.childForFieldName("body");
+    const signature = source.slice(method.startIndex, body2?.startIndex ?? method.endIndex).replace(/\s/g, "");
+    compactSignatures.set(sourceText(name2, source), signature);
+  }
+  const header = compactSignatures.get("Header") ?? "";
+  const writeHeader = compactSignatures.get("WriteHeader") ?? "";
+  const write = compactSignatures.get("Write") ?? "";
+  const headerType = [...httpAliases].some(
+    (alias) => new RegExp(`Header\\(\\)(?:[A-Za-z_]\\w*)?${escapeRegExp(alias)}\\.Header$`).test(header)
+  );
+  return headerType && /WriteHeader\((?:[A-Za-z_]\w*)?int\)$/.test(writeHeader) && /Write\((?:[A-Za-z_]\w*)?\[\]byte\)\((?:[A-Za-z_]\w*)?int,(?:[A-Za-z_]\w*)?error\)$/.test(write);
+}
+function methodReceiverName(method, source) {
+  const receiver = method.childForFieldName("receiver");
+  if (receiver === null) return void 0;
+  return sourceText(receiver, source).match(/\(\s*([A-Za-z_]\w*)\s+/)?.[1];
+}
+function writeHasProvenBound(writeMethod, accumulatingWrite, source, writeReceiver, bufferField) {
+  const methodText = maskGoLexicalNoise(writeMethod, source);
+  const input = methodText.match(/\bWrite\s*\(\s*([A-Za-z_]\w*)\s+\[\s*\]\s*byte\b/)?.[1];
+  if (input === void 0) return false;
+  const compact = (value) => value.replace(/\s/g, "");
+  const inputLength = `len\\(${escapeRegExp(input)}\\)`;
+  const bufferExpression = `${escapeRegExp(writeReceiver)}\\.${escapeRegExp(bufferField)}`;
+  const bufferLength = `${bufferExpression}\\.Len\\(\\)`;
+  const bound = `(?:(?:[A-Za-z_]\\w*\\.)*(?:max(?:imum)?\\w*|(?:limit|cap|quota|budget)\\w*|[A-Za-z_]\\w*(?:limit|cap|quota|budget)\\w*)|[1-9]\\d*)`;
+  const sum = `(?:${bufferLength}\\+${inputLength}|${inputLength}\\+${bufferLength})`;
+  const remaining = `(?:${bound}-${bufferLength})`;
+  const body2 = writeMethod.childForFieldName("body");
+  if (body2 === null) return false;
+  for (const branch of topLevelStatements(body2).filter(
+    (node) => node.type === "if_statement" && node.endIndex <= accumulatingWrite.startIndex
+  )) {
+    const consequence = [...branch.namedChildren].find((child) => child.type === "block") ?? null;
+    const condition = [...branch.namedChildren].find((child) => child.type === "binary_expression") ?? null;
+    const initializer = [...branch.namedChildren].find((child) => child.type === "short_var_declaration") ?? null;
+    if (condition === null || consequence === null || !hasUnconditionalTopLevelReturn(consequence)) continue;
+    const conditionText = compact(maskGoLexicalNoise(condition, source));
+    const consequenceText = compact(maskGoLexicalNoise(consequence, source));
+    const unboundedWrite = new RegExp(
+      `${bufferExpression}\\.Write\\(${escapeRegExp(input)}\\)`
+    ).test(consequenceText);
+    if (initializer === null) {
+      const rejectsOverflow = [
+        new RegExp(`^${sum}(?:>|>=)${bound}$`, "i"),
+        new RegExp(`^${bound}(?:<|<=)${sum}$`, "i"),
+        new RegExp(`^${inputLength}(?:>|>=)${remaining}$`, "i"),
+        new RegExp(`^${remaining}(?:<|<=)${inputLength}$`, "i")
+      ].some((pattern) => pattern.test(conditionText));
+      if (rejectsOverflow && !unboundedWrite) return true;
+      continue;
+    }
+    const initializerText = compact(maskGoLexicalNoise(initializer, source));
+    const room = new RegExp(`^([A-Za-z_]\\w*):=${bound}-${bufferLength}$`, "i").exec(initializerText)?.[1];
+    if (room === void 0) continue;
+    if (!new RegExp(`^${escapeRegExp(room)}(?:<|<=)${inputLength}$`).test(conditionText)) continue;
+    const boundedWrite = new RegExp(
+      `${bufferExpression}\\.Write\\(${escapeRegExp(input)}\\[:${escapeRegExp(room)}\\]\\)`
+    ).test(consequenceText);
+    const guardsPositiveRoom = descendants(consequence, "if_statement").some((inner) => {
+      const innerCondition = [...inner.namedChildren].find((child) => child.type === "binary_expression");
+      const innerBlock = [...inner.namedChildren].find((child) => child.type === "block");
+      if (innerCondition === void 0 || innerBlock === void 0) return false;
+      const conditionText2 = compact(maskGoLexicalNoise(innerCondition, source));
+      const blockText = compact(maskGoLexicalNoise(innerBlock, source));
+      return new RegExp(`(?:${escapeRegExp(room)}>0|0<${escapeRegExp(room)})`).test(conditionText2) && new RegExp(`${bufferExpression}\\.Write\\(${escapeRegExp(input)}\\[:${escapeRegExp(room)}\\]\\)`).test(blockText);
+    });
+    if (boundedWrite && guardsPositiveRoom && !unboundedWrite) return true;
+  }
+  return false;
+}
+function topLevelStatements(block) {
+  return [...block.namedChildren].find((child) => child.type === "statement_list")?.namedChildren ?? [];
+}
+function hasUnconditionalTopLevelReturn(block) {
+  const statements = [...block.namedChildren].find((child) => child.type === "statement_list");
+  return statements?.namedChildren.some((child) => child.type === "return_statement") === true;
+}
+function responseWriterCallbackUses(root, lexicalSource, source, typeName, httpAliases) {
+  const functions = [
+    ...descendants(root, "function_declaration"),
+    ...descendants(root, "method_declaration"),
+    ...descendants(root, "func_literal")
+  ];
+  const interfaceCallbacks = responseWriterCallbackInterfaces(root, source, httpAliases);
+  const concreteCallbacks = responseWriterCallbackMethods(root, source, httpAliases);
+  const callbackCollections = responseWriterCallbackCollections(root, source, interfaceCallbacks, concreteCallbacks);
+  const constructors = responseWriterConstructors(root, lexicalSource, source, typeName);
+  const uses = [];
+  for (const fn of functions) {
+    const body2 = fn.childForFieldName("body");
+    if (body2 === null) continue;
+    const aliases = /* @__PURE__ */ new Set();
+    const aliasRelationships = /* @__PURE__ */ new Map();
+    const statements = descendants(body2, "short_var_declaration").concat(descendants(body2, "assignment_statement"), descendants(body2, "expression_statement")).filter((node) => sameSyntaxNode(owningFunction(node), fn)).sort((left, right) => left.startIndex - right.startIndex);
+    for (const statement of statements) {
+      const text = sourceText(statement, lexicalSource).trim();
+      const assignment = /^(?:var\s+)?([A-Za-z_]\w*)\s*(?::=|=)\s*(.+)$/.exec(text);
+      if (assignment !== null) {
+        const variable = assignment[1];
+        const value = assignment[2];
+        const direct = new RegExp(`^&\\s*${escapeRegExp(typeName)}\\s*\\{`).test(value);
+        const constructor = [...constructors.entries()].find(
+          ([name2]) => new RegExp(`^(?:[A-Za-z_]\\w*\\.)*${escapeRegExp(name2)}\\s*\\(`).test(value)
+        );
+        const alias = /^([A-Za-z_]\w*)$/.exec(value)?.[1];
+        if (direct) {
+          aliases.add(variable);
+          aliasRelationships.set(variable, [statement]);
+        } else if (constructor !== void 0) {
+          aliases.add(variable);
+          aliasRelationships.set(variable, [constructor[1], statement]);
+        } else if (alias !== void 0 && aliases.has(alias)) {
+          aliases.add(variable);
+          aliasRelationships.set(variable, [...aliasRelationships.get(alias) ?? [], statement]);
+        } else {
+          aliases.delete(variable);
+          aliasRelationships.delete(variable);
+        }
+      }
+      for (const call of descendants(statement, "call_expression")) {
+        const called = call.childForFieldName("function");
+        const argumentsNode = call.childForFieldName("arguments");
+        if (called?.type !== "selector_expression" || argumentsNode === null) continue;
+        const methodNode = called.childForFieldName("field");
+        const receiver = called.childForFieldName("operand");
+        if (methodNode === null || receiver === null) continue;
+        const method = sourceText(methodNode, source);
+        if (!/^(?:Authenticate|Authorize|ServeHTTP|Handle|Invoke|Process|Render|WriteResponse)$/.test(method)) continue;
+        const passed = argumentsNode.namedChildren.map((argument, position) => ({ name: sourceText(argument, source).trim(), position })).find(({ name: name2 }) => aliases.has(name2));
+        if (passed === void 0) continue;
+        if (!hasCallbackProvenance(
+          fn,
+          receiver,
+          method,
+          call,
+          source,
+          interfaceCallbacks,
+          concreteCallbacks,
+          callbackCollections,
+          passed.position
+        )) continue;
+        uses.push({
+          variable: passed.name,
+          method,
+          line: call.startPosition.row + 1,
+          node: call,
+          relationships: aliasRelationships.get(passed.name) ?? []
+        });
+      }
+    }
+  }
+  return uses;
+}
+function owningFunction(node) {
+  let current = node.parent;
+  while (current !== null) {
+    if (["function_declaration", "method_declaration", "func_literal"].includes(current.type)) return current;
+    current = current.parent;
+  }
+  return null;
+}
+function sameSyntaxNode(left, right) {
+  return left !== null && left.type === right.type && left.startIndex === right.startIndex && left.endIndex === right.endIndex;
+}
+function responseWriterCallbackInterfaces(root, source, httpAliases) {
+  const callbacks = /* @__PURE__ */ new Map();
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const name2 = typeSpec.childForFieldName("name");
+    const type = typeSpec.childForFieldName("type");
+    if (name2 === null || type?.type !== "interface_type") continue;
+    for (const method of descendants(type, "method_elem")) {
+      const methodName = method.childForFieldName("name");
+      const parameters = directParameterList(method);
+      if (methodName === null || parameters === void 0) continue;
+      const positions = responseWriterParameterPositions(parameters, source, httpAliases);
+      if (positions.size === 0) continue;
+      addCallbackContract(callbacks, sourceText(name2, source), sourceText(methodName, source), positions);
+    }
+  }
+  return callbacks;
+}
+function responseWriterCallbackMethods(root, source, httpAliases) {
+  const callbacks = /* @__PURE__ */ new Map();
+  for (const method of descendants(root, "method_declaration")) {
+    const name2 = method.childForFieldName("name");
+    const receiver = method.childForFieldName("receiver");
+    const parameters = directParameterList(method);
+    if (name2 === null || receiver === null || parameters === void 0) continue;
+    const positions = responseWriterParameterPositions(parameters, source, httpAliases);
+    if (positions.size === 0) continue;
+    const receiverType = sourceText(receiver, source).match(/\*?\s*([A-Za-z_]\w*)\s*\)$/)?.[1];
+    if (receiverType === void 0) continue;
+    addCallbackContract(callbacks, receiverType, sourceText(name2, source), positions);
+  }
+  return callbacks;
+}
+function directParameterList(node) {
+  return [...node.namedChildren].find((child) => child.type === "parameter_list");
+}
+function responseWriterParameterPositions(parameters, source, httpAliases) {
+  const positions = /* @__PURE__ */ new Set();
+  let position = 0;
+  for (const parameter of parameters.namedChildren.filter(
+    (child) => child.type === "parameter_declaration" || child.type === "variadic_parameter_declaration"
+  )) {
+    const type = parameter.childForFieldName("type");
+    if (type === null) continue;
+    const prefix = source.slice(parameter.startIndex, type.startIndex).trim();
+    const width = prefix === "" ? 1 : prefix.split(",").length;
+    const isResponseWriter = [...httpAliases].some(
+      (alias) => new RegExp(`^${escapeRegExp(alias)}\\s*\\.\\s*ResponseWriter$`).test(sourceText(type, source).trim())
+    );
+    if (isResponseWriter) {
+      for (let offset = 0; offset < width; offset += 1) positions.add(position + offset);
+    }
+    position += width;
+  }
+  return positions;
+}
+function addCallbackContract(contracts, typeName, method, positions) {
+  const methods = contracts.get(typeName) ?? /* @__PURE__ */ new Map();
+  methods.set(method, positions);
+  contracts.set(typeName, methods);
+}
+function responseWriterCallbackCollections(root, source, interfaces, concrete) {
+  const collections = /* @__PURE__ */ new Map();
+  for (const field of descendants(root, "field_declaration")) {
+    const text = sourceText(field, source).replace(/\s/g, "");
+    const match = /^([A-Za-z_]\w*)(?:\[\]|map\[[^\]]+\])\*?([A-Za-z_]\w*)$/.exec(text);
+    if (match === null) continue;
+    const [, fieldName, elementType] = match;
+    if (fieldName === void 0 || elementType === void 0) continue;
+    const methods = interfaces.get(elementType) ?? concrete.get(elementType);
+    if (methods !== void 0) collections.set(fieldName, methods);
+  }
+  return collections;
+}
+function responseWriterConstructors(root, lexicalSource, source, typeName) {
+  const constructors = /* @__PURE__ */ new Map();
+  for (const fn of descendants(root, "function_declaration")) {
+    const name2 = fn.childForFieldName("name");
+    const body2 = fn.childForFieldName("body");
+    if (name2 === null || body2 === null) continue;
+    const signature = source.slice(fn.startIndex, body2.startIndex).replace(/\s/g, "");
+    if (!new RegExp(`\\*${escapeRegExp(typeName)}$`).test(signature)) continue;
+    const allocationReturn = descendants(body2, "return_statement").find(
+      (statement) => sameSyntaxNode(owningFunction(statement), fn) && new RegExp(`^return\\s+&\\s*${escapeRegExp(typeName)}\\s*\\{`).test(sourceText(statement, lexicalSource).trim())
+    );
+    if (allocationReturn !== void 0) constructors.set(sourceText(name2, source), allocationReturn);
+  }
+  return constructors;
+}
+function hasCallbackProvenance(fn, receiver, method, call, source, interfaceCallbacks, concreteCallbacks, callbackCollections, argumentPosition) {
+  const receiverText = sourceText(receiver, source);
+  if (receiver.type !== "identifier") return false;
+  for (const parameter of descendants(fn, "parameter_declaration")) {
+    if (!sameSyntaxNode(owningFunction(parameter), fn)) continue;
+    const name2 = parameter.childForFieldName("name");
+    const type = parameter.childForFieldName("type");
+    if (name2 === null || type === null || sourceText(name2, source) !== receiverText) continue;
+    const typeText = sourceText(type, source).replace(/^\*+/, "");
+    if (interfaceCallbacks.get(typeText)?.get(method)?.has(argumentPosition) === true) return true;
+    if (concreteCallbacks.get(typeText)?.get(method)?.has(argumentPosition) === true) return true;
+  }
+  for (const range of descendants(fn, "range_clause")) {
+    if (!sameSyntaxNode(owningFunction(range), fn) || range.startIndex > call.startIndex) continue;
+    const left = range.childForFieldName("left");
+    const right = range.childForFieldName("right");
+    if (left === null || right === null) continue;
+    const bindsReceiver = descendants(left, "identifier").some((node) => sourceText(node, source) === receiverText);
+    const collection = sourceText(right, source).match(/\.\s*([A-Za-z_]\w*)\s*$/)?.[1];
+    if (bindsReceiver && collection !== void 0 && callbackCollections.get(collection)?.get(method)?.has(argumentPosition) === true) return true;
+  }
+  return false;
 }
 function clientResponseBodyCloseSignals(file, root) {
   const signals = [];
@@ -21742,6 +22135,7 @@ Authority:
 - server timeouts and graceful Shutdown (including long-lived local callback servers)
 - handler request bodies (r.Body) needing MaxBytesReader with a size class
 - client response bodies (resp.Body) needing LimitReader with a size class (token JSON vs metadata)
+- ResponseWriter intermediaries that accumulate output produced by a provider, plugin, or downstream callback: require a proven hard cap, bounded upstream contract, streaming/backpressure, or spill strategy; cite both the callback boundary and accumulation
 - outbound http.Client timeouts and request contexts
 - DefaultClient / http.Get/Post without deadlines
 
@@ -21749,6 +22143,8 @@ Hard exclusions \u2014 do NOT file unbounded-body findings for:
 - CLI stdin / multi-MB YAML or manifest inputs (product must accept large legitimate input)
 - Full product downloads of archives/binaries/checksum streams
 - Local OCI store / file reads that are not HTTP
+- test recorders, intrinsically bounded fixed responses, or callbacks whose hard output cap is established in prepared source
+- ordinary streaming to the real ResponseWriter and bounded in-memory assembly that is not callback-controlled
 - *_test.go noise
 
 Never label CLI stdin as an "attacker-controlled request body" unless it is an HTTP server handler.
@@ -21806,6 +22202,7 @@ var GO_HTTP_MODEL_SCHEMA = {
               "handler-body-limit",
               "client-response-limit",
               "body-limit",
+              "provider-output-limit",
               "graceful-shutdown",
               "client-timeout",
               "request-context",
@@ -22211,7 +22608,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.16",
+    version: "0.0.17",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {

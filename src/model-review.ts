@@ -21,6 +21,7 @@ Authority:
 - server timeouts and graceful Shutdown (including long-lived local callback servers)
 - handler request bodies (r.Body) needing MaxBytesReader with a size class
 - client response bodies (resp.Body) needing LimitReader with a size class (token JSON vs metadata)
+- ResponseWriter intermediaries that accumulate output produced by a provider, plugin, or downstream callback: require a proven hard cap, bounded upstream contract, streaming/backpressure, or spill strategy; cite both the callback boundary and accumulation
 - outbound http.Client timeouts and request contexts
 - DefaultClient / http.Get/Post without deadlines
 
@@ -28,6 +29,8 @@ Hard exclusions — do NOT file unbounded-body findings for:
 - CLI stdin / multi-MB YAML or manifest inputs (product must accept large legitimate input)
 - Full product downloads of archives/binaries/checksum streams
 - Local OCI store / file reads that are not HTTP
+- test recorders, intrinsically bounded fixed responses, or callbacks whose hard output cap is established in prepared source
+- ordinary streaming to the real ResponseWriter and bounded in-memory assembly that is not callback-controlled
 - *_test.go noise
 
 Never label CLI stdin as an "attacker-controlled request body" unless it is an HTTP server handler.
@@ -86,6 +89,7 @@ export const GO_HTTP_MODEL_SCHEMA: Record<string, unknown> = {
               "handler-body-limit",
               "client-response-limit",
               "body-limit",
+              "provider-output-limit",
               "graceful-shutdown",
               "client-timeout",
               "request-context",
