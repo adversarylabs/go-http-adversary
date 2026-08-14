@@ -21992,6 +21992,16 @@ function isDirectStatement(block, node) {
 }
 function directlyReachableInBlock(block, node, source) {
   if (!containsNode(block, node)) return false;
+  const expressionCase = enclosingExpressionCase(node, block);
+  if (expressionCase !== void 0) {
+    const statements = expressionCase.namedChildren.find((child) => child.type === "statement_list");
+    const statement = statements?.namedChildren.find((candidate) => containsNode(candidate, node));
+    if (statements === void 0 || statement === void 0 || !expressionCaseCanExecute(expressionCase, source)) return false;
+    if (statements.namedChildren.some(
+      (candidate) => candidate.endIndex < statement.startIndex && unconditionallyTerminatesBefore(statements, candidate, statement, source)
+    )) return false;
+    return directlyReachableInBlock(block, expressionCase, source);
+  }
   let target = node;
   let currentBlock = enclosingBlock(node);
   while (currentBlock !== null) {
@@ -22008,22 +22018,42 @@ function directlyReachableInBlock(block, node, source) {
   }
   return false;
 }
-function nestedBlockCanExecute(block, source) {
-  const parent = block.parent;
-  if (parent === null) return false;
-  if (parent.type === "if_statement") {
-    const condition = parent.childForFieldName("condition");
-    const conditionText = condition === null ? "" : goSourceSemantics(sourceText(condition, source));
-    const consequence = parent.childForFieldName("consequence");
-    if (sameSyntaxNode(consequence, block) && conditionText === "false") return false;
-    const alternative = parent.childForFieldName("alternative");
-    if (sameSyntaxNode(alternative, block) && conditionText === "true") return false;
+function enclosingExpressionCase(node, boundary) {
+  let current = node.parent;
+  while (current !== null && !sameSyntaxNode(current, boundary)) {
+    if (current.type === "expression_case") return current;
+    current = current.parent;
   }
-  if (parent.type === "for_statement") {
-    const condition = parent.childForFieldName("condition");
-    if (condition !== null && goSourceSemantics(sourceText(condition, source)) === "false") return false;
+  return void 0;
+}
+function expressionCaseCanExecute(expressionCase, source) {
+  const expressionSwitch = expressionCase.parent;
+  if (expressionSwitch?.type !== "expression_switch_statement") return true;
+  const switchValue = booleanLiteral(expressionSwitch.childForFieldName("value"), source);
+  const caseValue = booleanLiteral(expressionCase.childForFieldName("value"), source);
+  return switchValue === void 0 || caseValue === void 0 || switchValue === caseValue;
+}
+function nestedBlockCanExecute(block, source) {
+  let controller = block.parent;
+  if (controller?.type === "else_clause") controller = controller.parent;
+  if (controller === null) return false;
+  if (controller?.type === "if_statement") {
+    const condition = booleanLiteral(controller.childForFieldName("condition"), source);
+    const consequence = controller.childForFieldName("consequence");
+    if (consequence !== null && containsNode(consequence, block) && condition === false) return false;
+    const alternative = controller.childForFieldName("alternative");
+    if (alternative !== null && containsNode(alternative, block) && condition === true) return false;
+  }
+  if (controller?.type === "for_statement") {
+    if (booleanLiteral(controller.childForFieldName("condition"), source) === false) return false;
   }
   return true;
+}
+function booleanLiteral(node, source) {
+  const expression = unwrapExpression(node);
+  if (expression?.type === "true") return true;
+  if (expression?.type === "false") return false;
+  return void 0;
 }
 function unconditionallyTerminatesBefore(block, candidate, target, source) {
   if (candidate.type === "labeled_statement") {
@@ -22421,6 +22451,7 @@ function writeHasProvenBound(writeMethod, accumulatingWrite, source, writeReceiv
   return false;
 }
 function topLevelStatements(block) {
+  if (block.type === "statement_list") return block.namedChildren;
   return [...block.namedChildren].find((child) => child.type === "statement_list")?.namedChildren ?? [];
 }
 function hasUnconditionalTopLevelReturn(block) {

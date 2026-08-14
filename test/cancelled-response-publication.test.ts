@@ -225,6 +225,10 @@ test("recognizes reachable nested producer starts without reviving statically de
       "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
       "func (d *duplexHTTPCall) start() { if panic := func(any) {}; true { panic(\"continue\"); go d.makeRequest() } }",
     ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { switch true { case true: go d.makeRequest() } }",
+    ),
   ];
   for (const source of reachable) {
     const result = await repository(source);
@@ -233,10 +237,20 @@ test("recognizes reachable nested producer starts without reviving statically de
 
   const deadElse = vulnerable.replace(
     "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
-    "func (d *duplexHTTPCall) start() { if true { return } else { go d.makeRequest() } }",
+    "func (d *duplexHTTPCall) start() { if (true) { return } else { go d.makeRequest() } }",
   );
-  const result = await repository(deadElse);
-  assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  const deadConsequence = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { if (false) { go d.makeRequest() } }",
+  );
+  const deadSwitchCase = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { switch false { case true: go d.makeRequest() } }",
+  );
+  for (const source of [deadElse, deadConsequence, deadSwitchCase]) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
 });
 
 test("strings cannot fake producer cleanup or a response owner", async () => {
