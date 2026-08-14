@@ -327,6 +327,31 @@ test("diff locality accepts only the ownership relationship and ignores unrelate
     }],
   });
   assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+
+  const multilineComment = vulnerable.replace(
+    "return d.response.Body.Close()",
+    "return d.response.Body.Close(/* documentation\n    only */)",
+  );
+  const commentLines = new Set([
+    lineOf(multilineComment, "/* documentation"),
+    lineOf(multilineComment, "only */"),
+  ]);
+  const multilineResult = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current: multilineComment,
+      previous: vulnerable,
+      status: "modified",
+      changedLines: commentLines,
+    }],
+  });
+  assert.equal(
+    multilineResult.signals.some((item) => item.ruleId === ruleId),
+    false,
+    JSON.stringify(multilineResult.signals, null, 2),
+  );
 });
 
 test("normalizes parenthesized expressions and requires every ownership-chain step to be reachable", async () => {
@@ -347,6 +372,82 @@ test("normalizes parenthesized expressions and requires every ownership-chain st
     "d.response = response\n  return\n  d.response.Body.Close()",
   );
   assert.ok((await repository(unreachableCleanup)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("unconditional builtin panic and goto make chain nodes unreachable", async () => {
+  const absentChains = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { panic(\"stop\"); go d.makeRequest() }",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { goto done; go d.makeRequest(); done: }",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {\n  select {",
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {\n  panic(\"stop\")\n  select {",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {\n  select {",
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {\n  goto done\n  select {",
+    ).replace("\n}\nfunc (d *duplexHTTPCall) CloseRead()", "\ndone:\n  return nil\n}\nfunc (d *duplexHTTPCall) CloseRead()"),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) CloseRead() error {\n  _ = d.BlockUntilResponseReady()",
+      "func (d *duplexHTTPCall) CloseRead() error {\n  panic(\"stop\")\n  _ = d.BlockUntilResponseReady()",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) CloseRead() error {\n  _ = d.BlockUntilResponseReady()",
+      "func (d *duplexHTTPCall) CloseRead() error {\n  goto done\n  _ = d.BlockUntilResponseReady()",
+    ).replace("  return d.response.Body.Close()\n}", "  return d.response.Body.Close()\ndone:\n  return nil\n}"),
+  ];
+  for (const source of absentChains) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result, null, 2));
+  }
+
+  const localShadow = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { panic := func(any) {}; panic(\"continue\"); go d.makeRequest() }",
+  );
+  const packageShadow = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { panic(\"continue\"); go d.makeRequest() }",
+  ) + "\nvar panic = func(any) {}\n";
+  for (const source of [localShadow, packageShadow]) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const gotoTargetIsChain = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { goto launch; launch: go d.makeRequest() }",
+  );
+  const conditionalPanic = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { if shouldStop() { panic(\"stop\") }; go d.makeRequest() }",
+  );
+  for (const source of [gotoTargetIsChain, conditionalPanic]) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
+test("unreachable cleanup inside a synchronous cancellation helper does not prove ownership", async () => {
+  const helpers = [
+    "func (d *duplexHTTPCall) drainLate() { <-d.responseReady; panic(\"stop\"); d.response.Body.Close() }",
+    "func (d *duplexHTTPCall) drainLate() { <-d.responseReady; goto done; d.response.Body.Close(); done: }",
+  ];
+  for (const helper of helpers) {
+    const source = vulnerable
+      .replace(
+        "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+        `${helper}\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {`,
+      )
+      .replace(
+        "case <-d.ctx.Done():\n    return d.ctx.Err()",
+        "case <-d.ctx.Done():\n    d.drainLate()\n    return d.ctx.Err()",
+      );
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
 });
 
 test("requires builtin and standard-library provenance for signal and body-consumer calls", async () => {

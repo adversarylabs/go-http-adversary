@@ -227,7 +227,7 @@ function publishedResponses(
     const name = methodName(method, source);
     if (body === null || receiver === undefined || name === undefined) continue;
     const assignments = descendants(body, "assignment_statement").filter((node) => {
-      if (!sameSyntaxNode(owningFunction(node), method) || !directlyReachableInBlock(body, node)) return false;
+      if (!sameSyntaxNode(owningFunction(node), method) || !directlyReachableInBlock(body, node, lexicalFile)) return false;
       const sides = assignmentSides(node);
       return sides !== undefined && pathEquals(selectorPath(sides.left, source), [receiver, state.responseField]);
     }).sort((left, right) => left.startIndex - right.startIndex);
@@ -264,7 +264,7 @@ function producerSignalAfterPublication(
   const body = method.childForFieldName("body");
   if (body === null) return undefined;
   const deferred = descendants(body, "defer_statement").find((node) =>
-    sameSyntaxNode(owningFunction(node), method) && directlyReachableInBlock(body, node) &&
+    sameSyntaxNode(owningFunction(node), method) && directlyReachableInBlock(body, node, lexicalFile) &&
     descendants(node, "call_expression").some((call) =>
       pathEquals(callPath(call, lexicalFile), ["close"]) &&
       unshadowedBuiltin(call, "close", lexicalFile) &&
@@ -278,7 +278,7 @@ function producerSignalAfterPublication(
   ].filter((node) => sameSyntaxNode(owningFunction(node), method) && node.startIndex > assignment.endIndex);
   return candidates.find((node) => {
     if (!sameSyntaxNode(enclosingBlock(node), enclosingBlock(assignment)!)) return false;
-    if (!directlyReachableInBlock(body, node)) return false;
+    if (!directlyReachableInBlock(body, node, lexicalFile)) return false;
     if (node.type === "send_statement") {
       return pathEquals(selectorPath(node.namedChildren[0], lexicalFile), [receiver, completionField]);
     }
@@ -297,7 +297,7 @@ function asyncProducerStart(methods: Node[], producer: Node, producerName: strin
     const receiver = methodReceiverName(method, source);
     if (body === null || receiver === undefined) continue;
     const start = descendants(body, "go_statement").find((node) =>
-      sameSyntaxNode(owningFunction(node), method) && directlyReachableInBlock(body, node) &&
+      sameSyntaxNode(owningFunction(node), method) && directlyReachableInBlock(body, node, source) &&
       descendants(node, "call_expression").some((call) =>
         pathEquals(callPath(call, source), [receiver, producerName])
       )
@@ -320,7 +320,7 @@ function cancellationWaiters(
     const name = methodName(method, source);
     if (body === null || receiver === undefined || name === undefined) continue;
     for (const select of descendants(body, "select_statement")) {
-      if (!sameSyntaxNode(owningFunction(select), method) || !directlyReachableInBlock(body, select)) continue;
+      if (!sameSyntaxNode(owningFunction(select), method) || !directlyReachableInBlock(body, select, lexicalSource)) continue;
       const cases = select.namedChildren.filter((child) => child.type === "communication_case");
       const completionCase = cases.find((item) =>
         communicationReceiveMatches(item, lexicalSource, receiver, state.completionField)
@@ -412,7 +412,7 @@ function producerOwnsPublishedResponse(
   const assignedName = assigned?.type === "identifier" ? sourceText(assigned, source) : undefined;
   const directlyClosed = descendants(body, "call_expression").some((call) => {
     if (!sameSyntaxNode(owningFunction(call), publisher.method) || call.startIndex <= publisher.assignment.endIndex ||
-      !directlyReachableInBlock(body, call)) return false;
+      !directlyReachableInBlock(body, call, lexicalSource)) return false;
     if (!sameSyntaxNode(enclosingBlock(call), enclosingBlock(publisher.assignment)!)) return false;
     const path = callPath(call, lexicalSource);
     return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) ||
@@ -422,14 +422,14 @@ function producerOwnsPublishedResponse(
 
   return descendants(body, "call_expression").some((invocation) => {
     if (!sameSyntaxNode(owningFunction(invocation), publisher.method) ||
-      invocation.startIndex <= publisher.assignment.endIndex || !directlyReachableInBlock(body, invocation)) return false;
+      invocation.startIndex <= publisher.assignment.endIndex || !directlyReachableInBlock(body, invocation, lexicalSource)) return false;
     if (directStatementContaining(body, invocation)?.type !== "expression_statement") return false;
     const literal = invocation.childForFieldName("function");
     if (literal?.type !== "func_literal" || callArguments(invocation).length !== 0) return false;
     const literalBody = literal.childForFieldName("body");
     if (literalBody === null) return false;
     return descendants(literalBody, "call_expression").some((call) => {
-      if (!sameSyntaxNode(owningFunction(call), literal) || !directlyReachableInBlock(literalBody, call)) return false;
+      if (!sameSyntaxNode(owningFunction(call), literal) || !directlyReachableInBlock(literalBody, call, lexicalSource)) return false;
       const path = callPath(call, lexicalSource);
       return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) ||
         (assignedName !== undefined && pathEquals(path, [assignedName, "Body", "Close"]));
@@ -455,14 +455,14 @@ function responseOwners(
     if (body === null || receiver === undefined || name === undefined) continue;
     const waitCalls = descendants(body, "call_expression").filter((call) =>
       sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body, call) &&
-      directlyReachableInBlock(body, call) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
+      directlyReachableInBlock(body, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
     );
     for (const waitCall of waitCalls) {
       if (waitCallHasTerminatingErrorGuard(waitCall, lexicalSource)) continue;
       const bodyUse = responseBodyUseAfter(body, waitCall, [receiver, state.responseField], lexicalSource, bodyConsumerPaths);
       if (bodyUse === undefined) continue;
       if (!sameSyntaxNode(enclosingBlock(waitCall), enclosingBlock(bodyUse)!)) continue;
-      if (hasUnconditionalReturnBetween(body, waitCall, bodyUse)) continue;
+      if (hasUnconditionalTerminationBetween(body, waitCall, bodyUse, lexicalSource)) continue;
       if (callerReobservesCompletion(body, waitCall, bodyUse, receiver, state.completionField, lexicalSource)) continue;
       owners.push({ method, methodName: name, waitCall, bodyUse });
     }
@@ -470,13 +470,13 @@ function responseOwners(
     for (const wrapper of wrappers) {
       for (const wrapperCall of descendants(body, "call_expression").filter((call) =>
         sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body, call) &&
-        directlyReachableInBlock(body, call) && pathEquals(callPath(call, lexicalSource), [receiver, wrapper.name])
+        directlyReachableInBlock(body, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, wrapper.name])
       )) {
         const responseName = assignedIdentifier(wrapperCall, source);
         if (responseName === undefined) continue;
         const bodyUse = responseBodyUseAfter(body, wrapperCall, [responseName], lexicalSource, bodyConsumerPaths);
         if (bodyUse === undefined || !sameSyntaxNode(enclosingBlock(wrapperCall), enclosingBlock(bodyUse)!)) continue;
-        if (hasUnconditionalReturnBetween(body, wrapperCall, bodyUse)) continue;
+        if (hasUnconditionalTerminationBetween(body, wrapperCall, bodyUse, lexicalSource)) continue;
         owners.push({ method, methodName: name, waitCall: wrapperCall, bodyUse });
       }
     }
@@ -493,7 +493,7 @@ function responseBodyUseAfter(
 ): Node | undefined {
   return descendants(body, "call_expression").find((call) => {
     if (call.startIndex <= waitCall.endIndex || !sameSyntaxNode(owningFunction(call), owningFunction(waitCall)!) ||
-      !directlyReachableInBlock(body, call)) return false;
+      !directlyReachableInBlock(body, call, source)) return false;
     const path = callPath(call, source);
     const bodyPath = [...responsePath, "Body"];
     if (pathEquals(path, [...bodyPath, "Close"]) || pathEquals(path, [...bodyPath, "Read"])) return true;
@@ -555,16 +555,16 @@ function responseWaitWrappers(
     const name = methodName(method, source);
     if (body === null || receiver === undefined || name === undefined) continue;
     const waitCall = descendants(body, "call_expression").find((call) =>
-      sameSyntaxNode(owningFunction(call), method) && directlyReachableInBlock(body, call) &&
+      sameSyntaxNode(owningFunction(call), method) && directlyReachableInBlock(body, call, lexicalSource) &&
       pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
     );
     if (waitCall === undefined) continue;
     const responseReturn = descendants(body, "return_statement").find((statement) =>
-      sameSyntaxNode(owningFunction(statement), method) && directlyReachableInBlock(body, statement) &&
+      sameSyntaxNode(owningFunction(statement), method) && directlyReachableInBlock(body, statement, lexicalSource) &&
       statement.startIndex > waitCall.endIndex &&
       statement.namedChildren.some((child) => pathEquals(selectorPath(child, lexicalSource), [receiver, state.responseField]))
     );
-    if (responseReturn === undefined || hasUnconditionalReturnBetween(body, waitCall, responseReturn)) continue;
+    if (responseReturn === undefined || hasUnconditionalTerminationBetween(body, waitCall, responseReturn, lexicalSource)) continue;
     if (callerReobservesCompletion(body, waitCall, responseReturn, receiver, state.completionField, lexicalSource)) continue;
     wrappers.push({ name });
   }
@@ -584,16 +584,16 @@ function helperSynchronizesAndCloses(
   const receive = statements.find((statement) =>
     communicationReceiveTextMatches(statement, lexicalSource, receiver, state.completionField)
   );
-  if (receive === undefined || !directlyReachableInBlock(body, receive)) return false;
+  if (receive === undefined || !directlyReachableInBlock(body, receive, lexicalSource)) return false;
   const directClose = descendants(body, "call_expression").some((call) =>
     sameSyntaxNode(owningFunction(call), method) && call.startIndex > receive.endIndex &&
-    directlyReachableInBlock(body, call) &&
+    directlyReachableInBlock(body, call, lexicalSource) &&
     pathEquals(callPath(call, lexicalSource), [receiver, state.responseField, "Body", "Close"])
   );
   if (directClose) return true;
   return statements.some((statement) => {
     if (statement.type !== "if_statement" || statement.startIndex <= receive.endIndex ||
-      !directlyReachableInBlock(body, statement)) return false;
+      !directlyReachableInBlock(body, statement, lexicalSource)) return false;
     const condition = statement.childForFieldName("condition") ??
       statement.namedChildren.find((child) => child.type === "binary_expression");
     const consequence = statement.childForFieldName("consequence") ??
@@ -602,7 +602,7 @@ function helperSynchronizesAndCloses(
     const expected = `${receiver}.${state.responseField}!=nil`;
     if (sourceText(condition, lexicalSource).replace(/\s/g, "") !== expected) return false;
     return descendants(consequence, "call_expression").some((call) =>
-      sameSyntaxNode(owningFunction(call), method) && directlyReachableInBlock(consequence, call) &&
+      sameSyntaxNode(owningFunction(call), method) && directlyReachableInBlock(consequence, call, lexicalSource) &&
       pathEquals(callPath(call, lexicalSource), [receiver, state.responseField, "Body", "Close"])
     );
   });
@@ -710,12 +710,43 @@ function isDirectStatement(block: Node, node: Node): boolean {
   return false;
 }
 
-function directlyReachableInBlock(block: Node, node: Node): boolean {
+function directlyReachableInBlock(block: Node, node: Node, source: string): boolean {
   const statement = directStatementContaining(block, node);
   if (statement === undefined) return false;
   return !topLevelStatements(block).some((candidate) =>
-    candidate.endIndex < statement.startIndex && candidate.type === "return_statement"
+    candidate.endIndex < statement.startIndex &&
+    unconditionallyTerminatesBefore(block, candidate, statement, source)
   );
+}
+
+function unconditionallyTerminatesBefore(
+  block: Node,
+  candidate: Node,
+  target: Node,
+  source: string,
+): boolean {
+  if (candidate.type === "labeled_statement") {
+    const nested = candidate.namedChildren.find((child) => child.type !== "label_name");
+    return nested !== undefined && unconditionallyTerminatesBefore(block, nested, target, source);
+  }
+  if (candidate.type === "return_statement") return true;
+  if (candidate.type === "goto_statement") {
+    const label = candidate.namedChildren.find((child) => child.type === "label_name");
+    if (label === undefined) return true;
+    const name = sourceText(label, source);
+    const destination = topLevelStatements(block).find((statement) => {
+      const destinationLabel = statement.childForFieldName("label");
+      return statement.type === "labeled_statement" && destinationLabel !== null &&
+        sourceText(destinationLabel, source) === name;
+    });
+    if (destination === undefined) return true;
+    return destination.startIndex < candidate.startIndex || destination.startIndex > target.startIndex;
+  }
+  if (candidate.type !== "expression_statement") return false;
+  const expression = unwrapExpression(candidate.namedChildren[0]);
+  return expression?.type === "call_expression" &&
+    pathEquals(callPath(expression, source), ["panic"]) &&
+    unshadowedBuiltin(expression, "panic", source);
 }
 
 function unshadowedBuiltin(use: Node, name: string, source: string): boolean {
@@ -769,13 +800,18 @@ function directStatementContaining(block: Node, node: Node): Node | undefined {
   return undefined;
 }
 
-function hasUnconditionalReturnBetween(block: Node, before: Node, after: Node): boolean {
+function hasUnconditionalTerminationBetween(
+  block: Node,
+  before: Node,
+  after: Node,
+  source: string,
+): boolean {
   const beforeStatement = directStatementContaining(block, before);
   const afterStatement = directStatementContaining(block, after);
   if (beforeStatement === undefined || afterStatement === undefined) return true;
   return topLevelStatements(block).some((statement) =>
-    statement.type === "return_statement" &&
-    statement.startIndex > beforeStatement.endIndex && statement.endIndex < afterStatement.startIndex
+    statement.startIndex > beforeStatement.endIndex && statement.endIndex < afterStatement.startIndex &&
+    unconditionallyTerminatesBefore(block, statement, afterStatement, source)
   );
 }
 
@@ -805,6 +841,7 @@ function semanticallyChanged(file: SourceRevision, line: number, endLine = line)
       candidate >= line && candidate <= endLine && !hasInlineGoComment(currentLines[candidate - 1] ?? "")
     );
   }
+  if (goSourceSemantics(file.current) === goSourceSemantics(file.previous)) return false;
   const previousLines = file.previous.split("\n");
   for (let candidate = line; candidate <= endLine; candidate += 1) {
     if (!file.changedLines.has(candidate)) continue;
@@ -820,17 +857,37 @@ function hasInlineGoComment(line: string): boolean {
 }
 
 function goLineSemantics(line: string): string {
+  return goSourceSemantics(line);
+}
+
+function goSourceSemantics(source: string): string {
   let quote: '"' | "'" | "`" | undefined;
   let escaped = false;
+  let blockComment = false;
+  let lineComment = false;
   let semantic = "";
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index]!;
-    const next = line[index + 1];
-    if (quote === undefined && character === "/" && next === "/") break;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index]!;
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote === undefined && character === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
     if (quote === undefined && character === "/" && next === "*") {
-      const end = line.indexOf("*/", index + 2);
-      if (end < 0) break;
-      index = end + 1;
+      blockComment = true;
+      index += 1;
       continue;
     }
     semantic += character;
