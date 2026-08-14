@@ -211,6 +211,34 @@ test("requires reachable producer signalling and body ownership", async () => {
   }
 });
 
+test("recognizes reachable nested producer starts without reviving statically dead blocks", async () => {
+  const reachable = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if true { go d.makeRequest() } }",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if panic := func(any) {}; true { _ = panic; go d.makeRequest() } }",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if panic := func(any) {}; true { panic(\"continue\"); go d.makeRequest() } }",
+    ),
+  ];
+  for (const source of reachable) {
+    const result = await repository(source);
+    assert.ok(result.signals.some((item) => item.ruleId === ruleId), JSON.stringify(result.signals, null, 2));
+  }
+
+  const deadElse = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { if true { return } else { go d.makeRequest() } }",
+  );
+  const result = await repository(deadElse);
+  assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+});
+
 test("strings cannot fake producer cleanup or a response owner", async () => {
   const fakeCleanup = vulnerable.replace("d.response = response", 'd.response = response\n  log.Print("d.response.Body.Close()")');
   const fakeOwner = vulnerable.replace("if d.response == nil { return nil }\n  return d.response.Body.Close()", 'log.Print("d.response.Body.Close()")\n  return nil');

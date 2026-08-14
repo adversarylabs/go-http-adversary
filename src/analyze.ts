@@ -717,12 +717,41 @@ function isDirectStatement(block: Node, node: Node): boolean {
 }
 
 function directlyReachableInBlock(block: Node, node: Node, source: string): boolean {
-  const statement = directStatementContaining(block, node);
-  if (statement === undefined) return false;
-  return !topLevelStatements(block).some((candidate) =>
-    candidate.endIndex < statement.startIndex &&
-    unconditionallyTerminatesBefore(block, candidate, statement, source)
-  );
+  if (!containsNode(block, node)) return false;
+  let target = node;
+  let currentBlock = enclosingBlock(node);
+  while (currentBlock !== null) {
+    const scope = currentBlock;
+    const statement = directStatementContaining(scope, target);
+    if (statement === undefined) return false;
+    if (topLevelStatements(scope).some((candidate) =>
+      candidate.endIndex < statement.startIndex &&
+      unconditionallyTerminatesBefore(scope, candidate, statement, source)
+    )) return false;
+    if (sameSyntaxNode(scope, block)) return true;
+    if (!nestedBlockCanExecute(scope, source)) return false;
+    target = scope;
+    currentBlock = enclosingBlock(scope);
+  }
+  return false;
+}
+
+function nestedBlockCanExecute(block: Node, source: string): boolean {
+  const parent = block.parent;
+  if (parent === null) return false;
+  if (parent.type === "if_statement") {
+    const condition = parent.childForFieldName("condition");
+    const conditionText = condition === null ? "" : goSourceSemantics(sourceText(condition, source));
+    const consequence = parent.childForFieldName("consequence");
+    if (sameSyntaxNode(consequence, block) && conditionText === "false") return false;
+    const alternative = parent.childForFieldName("alternative");
+    if (sameSyntaxNode(alternative, block) && conditionText === "true") return false;
+  }
+  if (parent.type === "for_statement") {
+    const condition = parent.childForFieldName("condition");
+    if (condition !== null && goSourceSemantics(sourceText(condition, source)) === "false") return false;
+  }
+  return true;
 }
 
 function unconditionallyTerminatesBefore(
