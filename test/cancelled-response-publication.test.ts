@@ -329,6 +329,87 @@ test("diff locality accepts only the ownership relationship and ignores unrelate
   assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
 });
 
+test("normalizes parenthesized expressions and requires every ownership-chain step to be reachable", async () => {
+  const variants = [
+    vulnerable.replace("d.response = response", "d.response = (nil)"),
+    vulnerable.replace("func (d *duplexHTTPCall) start() { go d.makeRequest() }", "func (d *duplexHTTPCall) start() { return; go d.makeRequest() }"),
+    vulnerable.replace("func (d *duplexHTTPCall) BlockUntilResponseReady() error {\n  select {", "func (d *duplexHTTPCall) BlockUntilResponseReady() error {\n  return nil\n  select {"),
+    vulnerable.replace("func (d *duplexHTTPCall) CloseRead() error {\n  _ = d.BlockUntilResponseReady()", "func (d *duplexHTTPCall) CloseRead() error {\n  return nil\n  _ = d.BlockUntilResponseReady()"),
+    vulnerable.replace("d.response = response", "d.response = response\n  d.response = nil"),
+  ];
+  for (const source of variants) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+
+  const unreachableCleanup = vulnerable.replace(
+    "d.response = response",
+    "d.response = response\n  return\n  d.response.Body.Close()",
+  );
+  assert.ok((await repository(unreachableCleanup)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("requires builtin and standard-library provenance for signal and body-consumer calls", async () => {
+  const shadowedClose = vulnerable.replace(
+    "type duplexHTTPCall struct {",
+    "func close(chan struct{}) {}\n\ntype duplexHTTPCall struct {",
+  );
+  const fakeReadAll = vulnerable
+    .replace("type duplexHTTPCall struct {", "type reader struct{}\nfunc (reader) ReadAll(any) error { return nil }\nvar fake reader\n\ntype duplexHTTPCall struct {")
+    .replace("return d.response.Body.Close()", "return fake.ReadAll(d.response.Body)");
+  for (const source of [shadowedClose, fakeReadAll]) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+
+  const standardReadAll = vulnerable
+    .replace('  "net/http"', '  "net/http"\n  "io"')
+    .replace("return d.response.Body.Close()", "_, err := io.ReadAll(d.response.Body); return err");
+  assert.ok((await repository(standardReadAll)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("accepts synchronous producer and cancellation cleanup through bounded direct calls", async () => {
+  const producerIIFE = vulnerable.replace(
+    "d.response = response",
+    "d.response = response\n  func() { d.response.Body.Close() }()",
+  );
+  const cancellationHelper = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) drainLate() { <-d.responseReady; if d.response != nil { d.response.Body.Close() } }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace("case <-d.ctx.Done():\n    return d.ctx.Err()", "case <-d.ctx.Done():\n    d.drainLate()\n    return d.ctx.Err()");
+  const parenthesizedDrain = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    <-(d.responseReady)\n    return d.ctx.Err()",
+  );
+  for (const source of [producerIIFE, cancellationHelper, parenthesizedDrain]) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+
+  const parenthesizedCases = vulnerable
+    .replace("case <-d.responseReady:", "case <-(d.responseReady):")
+    .replace("case <-d.ctx.Done():", "case <-(d.ctx.Done()):");
+  assert.ok((await repository(parenthesizedCases)).signals.some((item) => item.ruleId === ruleId));
+
+  const asyncProducerCleanup = vulnerable.replace(
+    "d.response = response",
+    "d.response = response\n  go func() { d.response.Body.Close() }()",
+  );
+  const asyncCancellationHelper = cancellationHelper.replace("d.drainLate()", "go d.drainLate()");
+  for (const source of [asyncProducerCleanup, asyncCancellationHelper]) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
+test("a reset after direct completion signalling does not erase the publication race", async () => {
+  const source = vulnerable
+    .replace("defer close(d.responseReady)\n", "")
+    .replace("d.response = response", "d.response = response\n  close(d.responseReady)\n  d.response = nil");
+  assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+});
+
 test("the model contract preserves the same ownership proof and quiet boundaries", () => {
   assert.match(GO_HTTP_MODEL_PROMPT, /typed \*http\.Response publication, its completion signal, and a real body owner/);
   assert.match(GO_HTTP_MODEL_PROMPT, /cancellation paths that synchronize with completion before cleanup/);
