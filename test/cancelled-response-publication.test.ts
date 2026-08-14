@@ -352,6 +352,44 @@ test("diff locality accepts only the ownership relationship and ignores unrelate
     false,
     JSON.stringify(multilineResult.signals, null, 2),
   );
+
+  const mixedCommentReflow = multilineComment.replace("type duplexHTTPCall struct {", "var unrelated = 1\n\ntype duplexHTTPCall struct {");
+  const mixedResult = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current: mixedCommentReflow,
+      previous: vulnerable,
+      status: "modified",
+      changedLines: new Set([
+        lineOf(mixedCommentReflow, "var unrelated"),
+        lineOf(mixedCommentReflow, "/* documentation"),
+        lineOf(mixedCommentReflow, "only */"),
+      ]),
+    }],
+  });
+  assert.equal(
+    mixedResult.signals.some((item) => item.ruleId === ruleId),
+    false,
+    JSON.stringify(mixedResult.signals, null, 2),
+  );
+
+  const changedConsumer = vulnerable.replace("d.response.Body.Close()", "d.response.Body.Read(nil)");
+  const changedConsumerResult = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current: changedConsumer,
+      previous: vulnerable,
+      status: "modified",
+      changedLines: new Set([lineOf(changedConsumer, "d.response.Body.Read(nil)")]),
+    }],
+  });
+  const changedConsumerSignal = changedConsumerResult.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(changedConsumerSignal, JSON.stringify(changedConsumerResult.signals, null, 2));
+  assert.equal(changedConsumerSignal.line, lineOf(changedConsumer, "d.response.Body.Read(nil)"));
 });
 
 test("normalizes parenthesized expressions and requires every ownership-chain step to be reachable", async () => {

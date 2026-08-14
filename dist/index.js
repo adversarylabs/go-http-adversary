@@ -21480,13 +21480,19 @@ async function analyzeDiscovery(discovery) {
     try {
       if (file.path.endsWith(".go")) {
         const tree = await parseGo(file.current);
+        const previousTree = file.previous === void 0 ? void 0 : await parseGo(file.previous);
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
           signals.push(...responseWriterCapabilitySignals(file, tree.rootNode));
           signals.push(...providerResponseBufferSignals(file, tree.rootNode));
           signals.push(...clientResponseBodyCloseSignals(file, tree.rootNode));
-          signals.push(...cancelledResponsePublicationSignals(file, tree.rootNode));
+          signals.push(...cancelledResponsePublicationSignals(
+            file,
+            tree.rootNode,
+            previousTree?.rootNode.hasError === false ? previousTree.rootNode : void 0
+          ));
         } finally {
+          previousTree?.delete();
           tree.delete();
         }
       }
@@ -21506,7 +21512,7 @@ async function analyzeDiscovery(discovery) {
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path))
   };
 }
-function cancelledResponsePublicationSignals(file, root) {
+function cancelledResponsePublicationSignals(file, root, previousRoot) {
   const httpAliases = standardImportAliases(root, file.current, "net/http", "http");
   const contextAliases = standardImportAliases(root, file.current, "context", "context");
   if (httpAliases.size === 0 || contextAliases.size === 0) return [];
@@ -21524,7 +21530,7 @@ function cancelledResponsePublicationSignals(file, root) {
         if (cancellationCaseHandlesResponse(waiter, state, typeMethods, lexicalFile, file.current)) continue;
         const owners = responseOwners(state, waiter, typeMethods, lexicalFile, file.current, bodyConsumerPaths);
         for (const owner of owners) {
-          const evidence = firstChangedNode(file, [
+          const evidence = firstChangedNode(file, root, previousRoot, [
             state.responseDeclaration,
             state.completionDeclaration,
             publisher.asyncStart,
@@ -22078,8 +22084,68 @@ function enclosingBlock(node) {
   }
   return null;
 }
-function firstChangedNode(file, nodes) {
-  return nodes.find((node) => semanticallyChanged(file, node.startPosition.row + 1, node.endPosition.row + 1));
+function firstChangedNode(file, root, previousRoot, nodes) {
+  return nodes.find((node) => nodeSemanticallyChanged(file, root, previousRoot, node));
+}
+function nodeSemanticallyChanged(file, root, previousRoot, node) {
+  const line = node.startPosition.row + 1;
+  const endLine = node.endPosition.row + 1;
+  if (!changed(file, line, endLine)) return false;
+  if (file.status !== "modified" || file.previous === void 0 || previousRoot === void 0) {
+    return semanticallyChanged(file, line, endLine);
+  }
+  const previousNode = correspondingPreviousNode(root, previousRoot, node, file.current, file.previous);
+  if (previousNode !== void 0 && previousNode.type === node.type) {
+    return goSourceSemantics(sourceText(node, file.current)) !== goSourceSemantics(sourceText(previousNode, file.previous));
+  }
+  return semanticallyChanged(file, line, endLine);
+}
+function correspondingPreviousNode(root, previousRoot, node, currentSource, previousSource) {
+  const owner = enclosingNamedDeclaration(node) ?? root;
+  const identity = declarationIdentity(owner, currentSource);
+  if (identity === void 0) return void 0;
+  const previousOwner = owner.type === "source_file" ? previousRoot : descendants(previousRoot, owner.type).find(
+    (candidate) => declarationIdentity(candidate, previousSource) === identity
+  );
+  if (previousOwner === void 0) return void 0;
+  const path = [];
+  let current = node;
+  while (!sameSyntaxNode(current, owner)) {
+    const parent = current.parent;
+    if (parent === null) return void 0;
+    const siblings = semanticNamedChildren(parent);
+    const index = siblings.findIndex((candidate) => sameSyntaxNode(candidate, current));
+    if (index < 0) return void 0;
+    path.unshift(index);
+    current = parent;
+  }
+  let previous = previousOwner;
+  for (const index of path) {
+    previous = semanticNamedChildren(previous)[index];
+    if (previous === void 0) return void 0;
+  }
+  return previous;
+}
+function enclosingNamedDeclaration(node) {
+  let current = node;
+  while (current !== null) {
+    if (["method_declaration", "function_declaration", "type_spec"].includes(current.type)) return current;
+    current = current.parent;
+  }
+  return void 0;
+}
+function declarationIdentity(node, source) {
+  if (node.type === "source_file") return "source_file";
+  const name2 = node.childForFieldName("name");
+  if (name2 === null) return void 0;
+  if (node.type === "method_declaration") {
+    const receiver = methodReceiverType(node, source);
+    return receiver === void 0 ? void 0 : `${node.type}:${receiver}.${sourceText(name2, source)}`;
+  }
+  return `${node.type}:${sourceText(name2, source)}`;
+}
+function semanticNamedChildren(node) {
+  return node.namedChildren.filter((child) => child.type !== "comment");
 }
 function semanticallyChanged(file, line, endLine = line) {
   if (!changed(file, line, endLine)) return false;

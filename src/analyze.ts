@@ -12,13 +12,19 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
     try {
       if (file.path.endsWith(".go")) {
         const tree = await parseGo(file.current);
+        const previousTree = file.previous === undefined ? undefined : await parseGo(file.previous);
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
           signals.push(...responseWriterCapabilitySignals(file, tree.rootNode));
           signals.push(...providerResponseBufferSignals(file, tree.rootNode));
           signals.push(...clientResponseBodyCloseSignals(file, tree.rootNode));
-          signals.push(...cancelledResponsePublicationSignals(file, tree.rootNode));
+          signals.push(...cancelledResponsePublicationSignals(
+            file,
+            tree.rootNode,
+            previousTree?.rootNode.hasError === false ? previousTree.rootNode : undefined,
+          ));
         } finally {
+          previousTree?.delete();
           tree.delete();
         }
       }
@@ -84,7 +90,7 @@ interface ResponseOwner {
  * asynchronously-started producer, race that signal against cancellation,
  * and have a caller that actually consumes or closes the published body.
  */
-function cancelledResponsePublicationSignals(file: SourceRevision, root: Node): Signal[] {
+function cancelledResponsePublicationSignals(file: SourceRevision, root: Node, previousRoot?: Node): Signal[] {
   const httpAliases = standardImportAliases(root, file.current, "net/http", "http");
   const contextAliases = standardImportAliases(root, file.current, "context", "context");
   if (httpAliases.size === 0 || contextAliases.size === 0) return [];
@@ -104,7 +110,7 @@ function cancelledResponsePublicationSignals(file: SourceRevision, root: Node): 
         if (cancellationCaseHandlesResponse(waiter, state, typeMethods, lexicalFile, file.current)) continue;
         const owners = responseOwners(state, waiter, typeMethods, lexicalFile, file.current, bodyConsumerPaths);
         for (const owner of owners) {
-          const evidence = firstChangedNode(file, [
+          const evidence = firstChangedNode(file, root, previousRoot, [
             state.responseDeclaration,
             state.completionDeclaration,
             publisher.asyncStart,
@@ -828,8 +834,95 @@ function enclosingBlock(node: Node): Node | null {
   return null;
 }
 
-function firstChangedNode(file: SourceRevision, nodes: Node[]): Node | undefined {
-  return nodes.find((node) => semanticallyChanged(file, node.startPosition.row + 1, node.endPosition.row + 1));
+function firstChangedNode(file: SourceRevision, root: Node, previousRoot: Node | undefined, nodes: Node[]): Node | undefined {
+  return nodes.find((node) => nodeSemanticallyChanged(file, root, previousRoot, node));
+}
+
+function nodeSemanticallyChanged(
+  file: SourceRevision,
+  root: Node,
+  previousRoot: Node | undefined,
+  node: Node,
+): boolean {
+  const line = node.startPosition.row + 1;
+  const endLine = node.endPosition.row + 1;
+  if (!changed(file, line, endLine)) return false;
+  if (file.status !== "modified" || file.previous === undefined || previousRoot === undefined) {
+    return semanticallyChanged(file, line, endLine);
+  }
+
+  const previousNode = correspondingPreviousNode(root, previousRoot, node, file.current, file.previous);
+  if (previousNode !== undefined && previousNode.type === node.type) {
+    return goSourceSemantics(sourceText(node, file.current)) !==
+      goSourceSemantics(sourceText(previousNode, file.previous));
+  }
+  return semanticallyChanged(file, line, endLine);
+}
+
+/**
+ * Map an evidence node to the same declaration and comment-insensitive AST
+ * path in the previous revision. Line-number comparison is insufficient when
+ * an unrelated edit shifts a multiline comment inside an evidence node.
+ */
+function correspondingPreviousNode(
+  root: Node,
+  previousRoot: Node,
+  node: Node,
+  currentSource: string,
+  previousSource: string,
+): Node | undefined {
+  const owner = enclosingNamedDeclaration(node) ?? root;
+  const identity = declarationIdentity(owner, currentSource);
+  if (identity === undefined) return undefined;
+  const previousOwner = owner.type === "source_file"
+    ? previousRoot
+    : descendants(previousRoot, owner.type).find((candidate) =>
+      declarationIdentity(candidate, previousSource) === identity
+    );
+  if (previousOwner === undefined) return undefined;
+
+  const path: number[] = [];
+  let current = node;
+  while (!sameSyntaxNode(current, owner)) {
+    const parent = current.parent;
+    if (parent === null) return undefined;
+    const siblings = semanticNamedChildren(parent);
+    const index = siblings.findIndex((candidate) => sameSyntaxNode(candidate, current));
+    if (index < 0) return undefined;
+    path.unshift(index);
+    current = parent;
+  }
+
+  let previous = previousOwner;
+  for (const index of path) {
+    previous = semanticNamedChildren(previous)[index]!;
+    if (previous === undefined) return undefined;
+  }
+  return previous;
+}
+
+function enclosingNamedDeclaration(node: Node): Node | undefined {
+  let current: Node | null = node;
+  while (current !== null) {
+    if (["method_declaration", "function_declaration", "type_spec"].includes(current.type)) return current;
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function declarationIdentity(node: Node, source: string): string | undefined {
+  if (node.type === "source_file") return "source_file";
+  const name = node.childForFieldName("name");
+  if (name === null) return undefined;
+  if (node.type === "method_declaration") {
+    const receiver = methodReceiverType(node, source);
+    return receiver === undefined ? undefined : `${node.type}:${receiver}.${sourceText(name, source)}`;
+  }
+  return `${node.type}:${sourceText(name, source)}`;
+}
+
+function semanticNamedChildren(node: Node): Node[] {
+  return node.namedChildren.filter((child) => child.type !== "comment");
 }
 
 function semanticallyChanged(file: SourceRevision, line: number, endLine = line): boolean {
