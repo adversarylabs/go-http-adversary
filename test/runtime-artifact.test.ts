@@ -28,7 +28,33 @@ test("the published runtime executes without node_modules", async () => {
   );
   await copyFile(join(projectRoot, "THIRD_PARTY_NOTICES.md"), join(artifact, "THIRD_PARTY_NOTICES.md"));
   await writeFile(join(artifact, "package.json"), '{"type":"module"}\n');
-  await writeFile(join(repository, "main.go"), "package sample\n\nfunc ready() bool { return true }\n");
+  await writeFile(join(repository, "main.go"), `package sample
+import ("context"; "net/http")
+type call struct {
+  ctx context.Context
+  client *http.Client
+  ready chan struct{}
+  response *http.Response
+}
+func (c *call) start() { go c.produce() }
+func (c *call) produce() {
+  defer close(c.ready)
+  response, err := c.client.Do(nil)
+  if err != nil { return }
+  c.response = response
+}
+func (c *call) wait() error {
+  select {
+  case <-c.ready: return nil
+  case <-c.ctx.Done(): return c.ctx.Err()
+  }
+}
+func (c *call) closeResponse() error {
+  _ = c.wait()
+  if c.response == nil { return nil }
+  return c.response.Body.Close()
+}
+`);
   await writeFile(input, `${JSON.stringify({ source: { path: repository } })}\n`);
 
   const bundle = await readFile(entrypoint, "utf8");
@@ -61,6 +87,12 @@ test("the published runtime executes without node_modules", async () => {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-http");
-  assert.equal(envelope.result.adversary.version, "0.0.17");
-  assert.deepEqual(envelope.result.findings, []);
+  assert.equal(envelope.result.adversary.version, "0.0.18");
+  assert.equal(
+    envelope.result.findings.some((finding: { ruleId?: string }) =>
+      finding.ruleId === "go-http.cancelled-response-publication"
+    ),
+    true,
+    JSON.stringify(envelope.result.findings, null, 2),
+  );
 });

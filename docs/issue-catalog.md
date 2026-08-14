@@ -520,6 +520,25 @@ Evidence required; LLM-only defaults medium/low; when unsure omit.
   - https://github.com/gin-gonic/gin — SetTrustedProxies
 
 ---
+### 24. `go-http.cancelled-response-publication` — Cancellation abandons a published response
+
+| Field | Value |
+| --- | --- |
+| **Severity** | medium |
+| **Target confidence** | medium |
+
+**What it is.** A background HTTP producer assigns a shared `*http.Response` and signals completion while the response owner waits on both completion and cancellation. If cancellation wins after both cases are ready, returning without re-observing completion can lose the only body-cleanup path.
+
+**Static detection.** Require one struct's typed response and completion fields, asynchronous producer publication before signal, a waiter select on that signal and `ctx.Done()`, and a same-owner caller that consumes or closes the body.
+
+**LLM role.** Explain the ownership handoff and confirm the proposed synchronization, drain, close, or transfer matches the surrounding API contract.
+
+**False-positive guards.** Cancellation-arm or wrapper synchronization before cleanup, producer-owned close, a proven no-late-publish or ownership-transfer protocol, no actual body owner, non-HTTP payload, and unrelated/comment-only changes.
+
+**Public example:**
+  - https://github.com/connectrpc/connect-go/pull/938
+
+---
 
 ## Implementation roadmap (after approval)
 1. P0 static rules + vulnerable/clean fixtures. 2. LLM enhancement. 3. Evidence-gated discovery. 4. Public-repo precision bake-off.

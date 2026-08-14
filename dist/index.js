@@ -17168,6 +17168,18 @@ var domain = {
       recommendation: "After checking the request error, defer response.Body.Close before consuming the body; if the response is returned, make that ownership transfer explicit."
     },
     {
+      id: "go-http.cancelled-response-publication",
+      title: "Cancellation can abandon a concurrently published HTTP response",
+      concern: "HTTP responses abandoned by a cancellation/completion race",
+      category: "reliability",
+      severity: "medium",
+      confidence: "medium",
+      summary: (count) => `${count} HTTP response ownership path${count === 1 ? " can" : "s can"} return cancellation while a published body is ready but unobserved.`,
+      whyItMatters: "Go selects choose pseudo-randomly among ready cases, so cancellation can win even after a producer has published a response and signalled completion.",
+      impact: "The body owner can lose the response, retaining transport resources and preventing connection reuse.",
+      recommendation: "Establish ownership of late responses and synchronize with completion before returning, draining, or closing a concurrently published response."
+    },
+    {
       id: "go-http.graceful-shutdown",
       title: "The server lifecycle has no graceful shutdown path",
       concern: "HTTP servers without graceful shutdown",
@@ -21473,6 +21485,7 @@ async function analyzeDiscovery(discovery) {
           signals.push(...responseWriterCapabilitySignals(file, tree.rootNode));
           signals.push(...providerResponseBufferSignals(file, tree.rootNode));
           signals.push(...clientResponseBodyCloseSignals(file, tree.rootNode));
+          signals.push(...cancelledResponsePublicationSignals(file, tree.rootNode));
         } finally {
           tree.delete();
         }
@@ -21492,6 +21505,478 @@ async function analyzeDiscovery(discovery) {
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path))
   };
+}
+function cancelledResponsePublicationSignals(file, root) {
+  const httpAliases = standardImportAliases(root, file.current, "net/http", "http");
+  const contextAliases = standardImportAliases(root, file.current, "context", "context");
+  if (httpAliases.size === 0 || contextAliases.size === 0) return [];
+  const lexicalFile = maskGoLexicalNoise(root, file.current);
+  const methods = descendants(root, "method_declaration");
+  const signals = [];
+  for (const state of ownedResponseStates(root, file.current, httpAliases, contextAliases)) {
+    const typeMethods = methods.filter((method) => methodReceiverType(method, file.current) === state.typeName);
+    const publishers = publishedResponses(state, typeMethods, lexicalFile, file.current);
+    const waiters = cancellationWaiters(state, typeMethods, lexicalFile, file.current);
+    for (const publisher of publishers) {
+      if (producerOwnsPublishedResponse(publisher, state, lexicalFile, file.current)) continue;
+      for (const waiter of waiters) {
+        if (cancellationCaseHandlesResponse(waiter, state, lexicalFile)) continue;
+        const owners = responseOwners(state, waiter, typeMethods, lexicalFile, file.current);
+        for (const owner of owners) {
+          const evidence = firstChangedNode(file, [
+            state.responseDeclaration,
+            state.completionDeclaration,
+            publisher.asyncStart,
+            publisher.assignment,
+            publisher.signal,
+            waitReceiveNode(waiter.completionCase),
+            waitReceiveNode(waiter.cancellationCase),
+            waiter.cancellationReturn,
+            owner.waitCall,
+            owner.bodyUse
+          ]);
+          if (evidence === void 0) continue;
+          signals.push({
+            ruleId: "go-http.cancelled-response-publication",
+            path: file.path,
+            line: evidence.startPosition.row + 1,
+            endLine: evidence.endPosition.row + 1,
+            message: `${state.typeName}.${publisher.methodName} publishes ${state.responseField} before signalling ${state.completionField}, but ${state.typeName}.${waiter.methodName} can return cancellation without re-observing completion before ${state.typeName}.${owner.methodName} owns the response body.`,
+            snippet: sourceText(evidence, file.current).trim().slice(0, 300),
+            data: {
+              ownerType: state.typeName,
+              responseField: state.responseField,
+              completionField: state.completionField,
+              producer: publisher.methodName,
+              waiter: waiter.methodName,
+              responseOwner: owner.methodName,
+              publicationLine: publisher.assignment.startPosition.row + 1,
+              signalLine: publisher.signal.startPosition.row + 1,
+              cancellationLine: waiter.cancellationCase.startPosition.row + 1,
+              bodyOwnerLine: owner.bodyUse.startPosition.row + 1
+            }
+          });
+        }
+      }
+    }
+  }
+  return signals;
+}
+function ownedResponseStates(root, source, httpAliases, contextAliases) {
+  const states = [];
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const name2 = typeSpec.childForFieldName("name");
+    const type = typeSpec.childForFieldName("type");
+    if (name2 === null || type?.type !== "struct_type") continue;
+    const responseFields = [];
+    const completionFields = [];
+    const contextFields = /* @__PURE__ */ new Set();
+    for (const field of descendants(type, "field_declaration").filter(
+      (candidate) => sameSyntaxNode(candidate.parent?.parent ?? null, type)
+    )) {
+      const text = sourceText(field, source).replace(/\s+/g, " ").trim();
+      for (const alias of httpAliases) {
+        const response = new RegExp(
+          `^([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*)\\s+\\*\\s*${escapeRegExp(alias)}\\s*\\.\\s*Response$`
+        ).exec(text);
+        for (const fieldName of response?.[1]?.split(",").map((item) => item.trim()) ?? []) {
+          responseFields.push({ name: fieldName, node: field });
+        }
+      }
+      const completion = /^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+chan\s+struct\s*\{\s*\}$/.exec(text);
+      for (const fieldName of completion?.[1]?.split(",").map((item) => item.trim()) ?? []) {
+        completionFields.push({ name: fieldName, node: field });
+      }
+      for (const alias of contextAliases) {
+        const context = new RegExp(
+          `^([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*)\\s+${escapeRegExp(alias)}\\s*\\.\\s*Context$`
+        ).exec(text);
+        for (const fieldName of context?.[1]?.split(",").map((item) => item.trim()) ?? []) {
+          contextFields.add(fieldName);
+        }
+      }
+    }
+    for (const response of responseFields) {
+      for (const completion of completionFields) {
+        states.push({
+          typeName: sourceText(name2, source),
+          responseField: response.name,
+          responseDeclaration: response.node,
+          completionField: completion.name,
+          completionDeclaration: completion.node,
+          contextFields
+        });
+      }
+    }
+  }
+  return states;
+}
+function methodReceiverType(method, source) {
+  const receiver = method.childForFieldName("receiver");
+  if (receiver === null) return void 0;
+  return sourceText(receiver, source).match(/\(\s*[A-Za-z_]\w*\s+\*?\s*([A-Za-z_]\w*)\s*\)/)?.[1];
+}
+function methodName(method, source) {
+  const name2 = method.childForFieldName("name");
+  return name2 === null ? void 0 : sourceText(name2, source);
+}
+function publishedResponses(state, methods, lexicalFile, source) {
+  const publishers = [];
+  for (const method of methods) {
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    const assignment = descendants(body2, "assignment_statement").find((node) => {
+      if (!sameSyntaxNode(owningFunction(node), method) || !isDirectStatement(body2, node)) return false;
+      const sides = assignmentSides(node);
+      return sides !== void 0 && pathEquals(selectorPath(sides.left, source), [receiver, state.responseField]) && sourceText(sides.right, lexicalFile).trim() !== "nil";
+    });
+    if (assignment === void 0) continue;
+    const signal = producerSignalAfterPublication(method, assignment, receiver, state.completionField, lexicalFile);
+    if (signal === void 0) continue;
+    const asyncStart = asyncProducerStart(methods, method, name2, source);
+    if (asyncStart === void 0) continue;
+    publishers.push({ method, methodName: name2, receiver, assignment, signal, asyncStart });
+  }
+  return publishers;
+}
+function producerSignalAfterPublication(method, assignment, receiver, completionField, lexicalFile) {
+  const body2 = method.childForFieldName("body");
+  if (body2 === null) return void 0;
+  const deferred = descendants(body2, "defer_statement").find(
+    (node) => sameSyntaxNode(owningFunction(node), method) && isDirectStatement(body2, node) && descendants(node, "call_expression").some(
+      (call) => pathEquals(callPath(call, lexicalFile), ["close"]) && pathEquals(selectorPath(callArguments(call)[0], lexicalFile), [receiver, completionField])
+    )
+  );
+  if (deferred !== void 0) return deferred;
+  const candidates = [
+    ...descendants(body2, "expression_statement"),
+    ...descendants(body2, "send_statement")
+  ].filter((node) => sameSyntaxNode(owningFunction(node), method) && node.startIndex > assignment.endIndex);
+  return candidates.find((node) => {
+    if (!sameSyntaxNode(enclosingBlock(node), enclosingBlock(assignment))) return false;
+    if (!isDirectStatement(body2, node)) return false;
+    if (node.type === "send_statement") {
+      return pathEquals(selectorPath(node.namedChildren[0], lexicalFile), [receiver, completionField]);
+    }
+    return descendants(node, "call_expression").some(
+      (call) => pathEquals(callPath(call, lexicalFile), ["close"]) && pathEquals(selectorPath(callArguments(call)[0], lexicalFile), [receiver, completionField])
+    );
+  });
+}
+function asyncProducerStart(methods, producer, producerName, source) {
+  for (const method of methods) {
+    if (sameSyntaxNode(method, producer)) continue;
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    if (body2 === null || receiver === void 0) continue;
+    const start2 = descendants(body2, "go_statement").find(
+      (node) => sameSyntaxNode(owningFunction(node), method) && isDirectStatement(body2, node) && descendants(node, "call_expression").some(
+        (call) => pathEquals(callPath(call, source), [receiver, producerName])
+      )
+    );
+    if (start2 !== void 0) return start2;
+  }
+  return void 0;
+}
+function cancellationWaiters(state, methods, lexicalSource, source) {
+  const waiters = [];
+  for (const method of methods) {
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    for (const select of descendants(body2, "select_statement")) {
+      if (!sameSyntaxNode(owningFunction(select), method)) continue;
+      const cases = select.namedChildren.filter((child) => child.type === "communication_case");
+      const completionCase = cases.find(
+        (item) => communicationReceiveMatches(item, lexicalSource, receiver, state.completionField)
+      );
+      const cancellationCase = cases.find(
+        (item) => communicationReceivesContextDone(item, lexicalSource, receiver, state.contextFields)
+      );
+      if (completionCase === void 0 || cancellationCase === void 0) continue;
+      const cancellationReturn = descendants(cancellationCase, "return_statement").filter((item) => sameSyntaxNode(owningFunction(item), method)).sort((left, right) => left.startIndex - right.startIndex)[0];
+      if (cancellationReturn === void 0) continue;
+      waiters.push({
+        method,
+        methodName: name2,
+        receiver,
+        select,
+        completionCase,
+        cancellationCase,
+        cancellationReturn
+      });
+    }
+  }
+  return waiters;
+}
+function waitReceiveNode(caseNode) {
+  return caseNode.namedChildren.find((child) => child.type === "receive_statement") ?? caseNode;
+}
+function directCaseStatements(caseNode) {
+  return caseNode.namedChildren.find((child) => child.type === "statement_list")?.namedChildren ?? [];
+}
+function communicationReceiveMatches(caseNode, source, receiver, field) {
+  const receive = waitReceiveNode(caseNode);
+  const text = sourceText(receive, source).replace(/\s/g, "");
+  return text === `<-${receiver}.${field}` || text.endsWith(`=<-${receiver}.${field}`);
+}
+function communicationReceivesContextDone(caseNode, source, receiver, contextFields) {
+  const receive = waitReceiveNode(caseNode);
+  const text = sourceText(receive, source).replace(/\s/g, "");
+  return [...contextFields].some(
+    (field) => text === `<-${receiver}.${field}.Done()` || text.endsWith(`=<-${receiver}.${field}.Done()`)
+  );
+}
+function cancellationCaseHandlesResponse(waiter, state, lexicalSource) {
+  const statements = waiter.cancellationCase.namedChildren.find((child) => child.type === "statement_list");
+  if (statements === void 0) return false;
+  const topLevel = directCaseStatements(waiter.cancellationCase);
+  const returnIndex = topLevel.findIndex((statement) => sameSyntaxNode(statement, waiter.cancellationReturn));
+  if (returnIndex < 0) return false;
+  return topLevel.slice(0, returnIndex).some(
+    (statement) => communicationReceiveTextMatches(statement, lexicalSource, waiter.receiver, state.completionField)
+  );
+}
+function communicationReceiveTextMatches(node, source, receiver, field) {
+  const text = sourceText(node, source).replace(/\s/g, "");
+  return text === `<-${receiver}.${field}` || text.endsWith(`=<-${receiver}.${field}`);
+}
+function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) {
+  const body2 = publisher.method.childForFieldName("body");
+  if (body2 === null) return false;
+  const assigned = assignmentSides(publisher.assignment)?.right;
+  const assignedName = assigned?.type === "identifier" ? sourceText(assigned, source) : void 0;
+  return descendants(body2, "call_expression").some((call) => {
+    if (!sameSyntaxNode(owningFunction(call), publisher.method) || call.startIndex <= publisher.assignment.endIndex) return false;
+    if (!sameSyntaxNode(enclosingBlock(call), enclosingBlock(publisher.assignment))) return false;
+    const path = callPath(call, lexicalSource);
+    return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) || assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]);
+  });
+}
+function responseOwners(state, waiter, methods, lexicalSource, source) {
+  const owners = [];
+  const wrappers = responseWaitWrappers(state, waiter, methods, lexicalSource, source);
+  for (const method of methods) {
+    if (sameSyntaxNode(method, waiter.method)) continue;
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    const waitCalls = descendants(body2, "call_expression").filter(
+      (call) => sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body2, call) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
+    );
+    for (const waitCall of waitCalls) {
+      if (waitCallHasTerminatingErrorGuard(waitCall, lexicalSource)) continue;
+      const bodyUse = responseBodyUseAfter(body2, waitCall, [receiver, state.responseField], lexicalSource);
+      if (bodyUse === void 0) continue;
+      if (!sameSyntaxNode(enclosingBlock(waitCall), enclosingBlock(bodyUse))) continue;
+      if (hasUnconditionalReturnBetween(body2, waitCall, bodyUse)) continue;
+      if (callerReobservesCompletion(body2, waitCall, bodyUse, receiver, state.completionField, lexicalSource)) continue;
+      owners.push({ method, methodName: name2, waitCall, bodyUse });
+    }
+    for (const wrapper of wrappers) {
+      for (const wrapperCall of descendants(body2, "call_expression").filter(
+        (call) => sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body2, call) && pathEquals(callPath(call, lexicalSource), [receiver, wrapper.name])
+      )) {
+        const responseName = assignedIdentifier(wrapperCall, source);
+        if (responseName === void 0) continue;
+        const bodyUse = responseBodyUseAfter(body2, wrapperCall, [responseName], lexicalSource);
+        if (bodyUse === void 0 || !sameSyntaxNode(enclosingBlock(wrapperCall), enclosingBlock(bodyUse))) continue;
+        if (hasUnconditionalReturnBetween(body2, wrapperCall, bodyUse)) continue;
+        owners.push({ method, methodName: name2, waitCall: wrapperCall, bodyUse });
+      }
+    }
+  }
+  return owners;
+}
+function responseBodyUseAfter(body2, waitCall, responsePath, source) {
+  return descendants(body2, "call_expression").find((call) => {
+    if (call.startIndex <= waitCall.endIndex || !sameSyntaxNode(owningFunction(call), owningFunction(waitCall)) || !isDirectStatement(body2, call)) return false;
+    const path = callPath(call, source);
+    const bodyPath = [...responsePath, "Body"];
+    if (pathEquals(path, [...bodyPath, "Close"]) || pathEquals(path, [...bodyPath, "Read"])) return true;
+    if (path === void 0 || !["ReadAll", "NewDecoder", "Copy", "CopyBuffer"].includes(path.at(-1) ?? "")) return false;
+    return callArguments(call).some((argument) => pathEquals(selectorPath(argument, source), bodyPath));
+  });
+}
+function callerReobservesCompletion(body2, waitCall, bodyUse, receiver, completionField, source) {
+  return [...descendants(body2, "receive_statement"), ...descendants(body2, "expression_statement")].some(
+    (receive) => sameSyntaxNode(owningFunction(receive), owningFunction(waitCall)) && sameSyntaxNode(enclosingBlock(receive), enclosingBlock(waitCall)) && receive.startIndex > waitCall.endIndex && receive.endIndex < bodyUse.startIndex && communicationReceiveTextMatches(receive, source, receiver, completionField)
+  );
+}
+function waitCallHasTerminatingErrorGuard(waitCall, source) {
+  let current = waitCall.parent;
+  while (current !== null && current.type !== "if_statement") {
+    if (current.type === "statement_list" || current.type === "block") return false;
+    current = current.parent;
+  }
+  if (current === null) return false;
+  const initializer = current.namedChildren.find((child) => child.type === "short_var_declaration");
+  const consequence = current.namedChildren.find((child) => child.type === "block");
+  if (initializer === void 0 || consequence === void 0 || !containsNode(initializer, waitCall)) return false;
+  const sides = assignmentSides(initializer);
+  if (sides?.left.type !== "identifier") return false;
+  const errorName = sourceText(sides.left, source).trim();
+  const condition = current.namedChildren.find((child) => child.type === "binary_expression");
+  if (condition === void 0 || sourceText(condition, source).replace(/\s/g, "") !== `${errorName}!=nil`) return false;
+  return topLevelStatements(consequence).some((statement) => statement.type === "return_statement");
+}
+function responseWaitWrappers(state, waiter, methods, lexicalSource, source) {
+  const wrappers = [];
+  for (const method of methods) {
+    if (sameSyntaxNode(method, waiter.method)) continue;
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    const waitCall = descendants(body2, "call_expression").find(
+      (call) => sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body2, call) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
+    );
+    if (waitCall === void 0) continue;
+    const responseReturn = descendants(body2, "return_statement").find(
+      (statement) => sameSyntaxNode(owningFunction(statement), method) && isDirectStatement(body2, statement) && statement.startIndex > waitCall.endIndex && statement.namedChildren.some((child) => pathEquals(selectorPath(child, lexicalSource), [receiver, state.responseField]))
+    );
+    if (responseReturn === void 0 || hasUnconditionalReturnBetween(body2, waitCall, responseReturn)) continue;
+    if (callerReobservesCompletion(body2, waitCall, responseReturn, receiver, state.completionField, lexicalSource)) continue;
+    wrappers.push({ name: name2 });
+  }
+  return wrappers;
+}
+function selectorPath(node, source) {
+  if (node === void 0 || node === null) return void 0;
+  if (node.type === "identifier") return [sourceText(node, source).trim()];
+  if (node.type === "selector_expression") {
+    const operand = selectorPath(node.childForFieldName("operand"), source);
+    const field = node.childForFieldName("field");
+    return operand === void 0 || field === null ? void 0 : [...operand, sourceText(field, source).trim()];
+  }
+  if (node.type === "parenthesized_expression" && node.namedChildren.length === 1) {
+    return selectorPath(node.namedChildren[0], source);
+  }
+  if (node.type === "expression_list" && node.namedChildren.length === 1) {
+    return selectorPath(node.namedChildren[0], source);
+  }
+  return void 0;
+}
+function callPath(call, source) {
+  if (call.type !== "call_expression") return void 0;
+  return selectorPath(call.childForFieldName("function"), source);
+}
+function callArguments(call) {
+  return call.childForFieldName("arguments")?.namedChildren ?? [];
+}
+function pathEquals(actual, expected) {
+  return actual !== void 0 && actual.length === expected.length && actual.every((part, index) => part === expected[index]);
+}
+function assignmentSides(statement) {
+  const rawLeft = statement.childForFieldName("left") ?? statement.namedChildren[0];
+  const rawRight = statement.childForFieldName("right") ?? statement.namedChildren.at(-1);
+  const left = rawLeft?.type === "expression_list" && rawLeft.namedChildren.length === 1 ? rawLeft.namedChildren[0] : rawLeft;
+  const right = rawRight?.type === "expression_list" && rawRight.namedChildren.length === 1 ? rawRight.namedChildren[0] : rawRight;
+  return left === void 0 || right === void 0 ? void 0 : { left, right };
+}
+function assignedIdentifier(call, source) {
+  let current = call.parent;
+  while (current !== null && current.type !== "assignment_statement" && current.type !== "short_var_declaration") {
+    if (current.type === "statement_list" || current.type === "block") return void 0;
+    current = current.parent;
+  }
+  if (current === null) return void 0;
+  const sides = assignmentSides(current);
+  return sides?.left.type === "identifier" ? sourceText(sides.left, source).trim() : void 0;
+}
+function isDirectStatement(block, node) {
+  let current = node;
+  while (current !== null && current.parent !== null) {
+    if (current.parent.type === "statement_list") return sameSyntaxNode(current.parent.parent, block);
+    current = current.parent;
+  }
+  return false;
+}
+function directStatementContaining(block, node) {
+  let current = node;
+  while (current !== null && current.parent !== null) {
+    if (current.parent.type === "statement_list") {
+      return sameSyntaxNode(current.parent.parent, block) ? current : void 0;
+    }
+    current = current.parent;
+  }
+  return void 0;
+}
+function hasUnconditionalReturnBetween(block, before, after) {
+  const beforeStatement = directStatementContaining(block, before);
+  const afterStatement = directStatementContaining(block, after);
+  if (beforeStatement === void 0 || afterStatement === void 0) return true;
+  return topLevelStatements(block).some(
+    (statement) => statement.type === "return_statement" && statement.startIndex > beforeStatement.endIndex && statement.endIndex < afterStatement.startIndex
+  );
+}
+function containsNode(container, candidate) {
+  return candidate.startIndex >= container.startIndex && candidate.endIndex <= container.endIndex;
+}
+function enclosingBlock(node) {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === "block") return current;
+    current = current.parent;
+  }
+  return null;
+}
+function firstChangedNode(file, nodes) {
+  return nodes.find((node) => semanticallyChanged(file, node.startPosition.row + 1, node.endPosition.row + 1));
+}
+function semanticallyChanged(file, line, endLine = line) {
+  if (!changed(file, line, endLine)) return false;
+  if (file.status !== "modified") return true;
+  const currentLines = file.current.split("\n");
+  if (file.previous === void 0) {
+    return [...file.changedLines].some(
+      (candidate) => candidate >= line && candidate <= endLine && !hasInlineGoComment(currentLines[candidate - 1] ?? "")
+    );
+  }
+  const previousLines = file.previous.split("\n");
+  for (let candidate = line; candidate <= endLine; candidate += 1) {
+    if (!file.changedLines.has(candidate)) continue;
+    const current = goLineSemantics(currentLines[candidate - 1] ?? "");
+    const previous = goLineSemantics(previousLines[candidate - 1] ?? "");
+    if (current !== previous) return true;
+  }
+  return false;
+}
+function hasInlineGoComment(line) {
+  return goLineSemantics(line) !== line.replace(/\s+/g, "").trim();
+}
+function goLineSemantics(line) {
+  let quote;
+  let escaped = false;
+  let semantic = "";
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index];
+    const next = line[index + 1];
+    if (quote === void 0 && character === "/" && next === "/") break;
+    if (quote === void 0 && character === "/" && next === "*") {
+      const end = line.indexOf("*/", index + 2);
+      if (end < 0) break;
+      index = end + 1;
+      continue;
+    }
+    semantic += character;
+    if (quote === "`") {
+      if (character === "`") quote = void 0;
+      continue;
+    }
+    if (quote !== void 0) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = void 0;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") quote = character;
+  }
+  return semantic.replace(/\s+/g, "").trim();
 }
 function providerResponseBufferSignals(file, root) {
   const lexicalFile = maskGoLexicalNoise(root, file.current);
@@ -21769,12 +22254,12 @@ function responseWriterCallbackInterfaces(root, source, httpAliases) {
     const type = typeSpec.childForFieldName("type");
     if (name2 === null || type?.type !== "interface_type") continue;
     for (const method of descendants(type, "method_elem")) {
-      const methodName = method.childForFieldName("name");
+      const methodName2 = method.childForFieldName("name");
       const parameters = directParameterList(method);
-      if (methodName === null || parameters === void 0) continue;
+      if (methodName2 === null || parameters === void 0) continue;
       const positions = responseWriterParameterPositions(parameters, source, httpAliases);
       if (positions.size === 0) continue;
-      addCallbackContract(callbacks, sourceText(name2, source), sourceText(methodName, source), positions);
+      addCallbackContract(callbacks, sourceText(name2, source), sourceText(methodName2, source), positions);
     }
   }
   return callbacks;
@@ -21985,10 +22470,10 @@ function responseWriterCapabilitySignals(file, root) {
     const declaredMethods = /* @__PURE__ */ new Set();
     for (const method of methods) {
       const receiver = method.childForFieldName("receiver");
-      const methodName = method.childForFieldName("name");
-      if (receiver === null || methodName === null) continue;
+      const methodName2 = method.childForFieldName("name");
+      if (receiver === null || methodName2 === null) continue;
       if (!new RegExp(`\\b${escapeRegExp(typeName)}\\b`).test(sourceText(receiver, file.current))) continue;
-      declaredMethods.add(sourceText(methodName, file.current));
+      declaredMethods.add(sourceText(methodName2, file.current));
     }
     const missing = claim.capabilities.filter(
       (capability) => capability === "Flusher" ? !declaredMethods.has("Flush") : !declaredMethods.has("Hijack")
@@ -22075,6 +22560,7 @@ async function discoverSources(ctx) {
     files.push({
       path: source.path,
       current: source.content,
+      ...change.previous === void 0 ? {} : { previous: change.previous },
       changedLines: change.changedLines,
       status: change.status
     });
@@ -22095,7 +22581,8 @@ async function changedSource(ctx, path) {
   if (head !== void 0 && !ctx.change?.worktree) args2.push(head);
   args2.push("--", path);
   const patch = await gitOutput(ctx.repoPath, args2);
-  return { changedLines: changedLineNumbers(patch), status: "modified" };
+  const previous = await gitOutput(ctx.repoPath, ["show", `${base}:${path}`]);
+  return { changedLines: changedLineNumbers(patch), status: "modified", previous };
 }
 async function existsAtRevision(repoPath, revision, path) {
   try {
@@ -22135,6 +22622,7 @@ Authority:
 - server timeouts and graceful Shutdown (including long-lived local callback servers)
 - handler request bodies (r.Body) needing MaxBytesReader with a size class
 - client response bodies (resp.Body) needing LimitReader with a size class (token JSON vs metadata)
+- response ownership across cancellation/completion races, but only when prepared evidence proves a typed *http.Response publication, its completion signal, and a real body owner
 - ResponseWriter intermediaries that accumulate output produced by a provider, plugin, or downstream callback: require a proven hard cap, bounded upstream contract, streaming/backpressure, or spill strategy; cite both the callback boundary and accumulation
 - outbound http.Client timeouts and request contexts
 - DefaultClient / http.Get/Post without deadlines
@@ -22145,6 +22633,7 @@ Hard exclusions \u2014 do NOT file unbounded-body findings for:
 - Local OCI store / file reads that are not HTTP
 - test recorders, intrinsically bounded fixed responses, or callbacks whose hard output cap is established in prepared source
 - ordinary streaming to the real ResponseWriter and bounded in-memory assembly that is not callback-controlled
+- cancellation paths that synchronize with completion before cleanup, producer-owned body cleanup, a proven no-late-publication or ownership-transfer protocol, or code without the complete publication-to-owner relationship
 - *_test.go noise
 
 Never label CLI stdin as an "attacker-controlled request body" unless it is an HTTP server handler.
@@ -22203,6 +22692,7 @@ var GO_HTTP_MODEL_SCHEMA = {
               "client-response-limit",
               "body-limit",
               "provider-output-limit",
+              "response-ownership",
               "graceful-shutdown",
               "client-timeout",
               "request-context",
@@ -22608,7 +23098,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.17",
+    version: "0.0.18",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {
