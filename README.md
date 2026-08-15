@@ -22,7 +22,7 @@ Highlights:
 | Area | Examples |
 | --- | --- |
 | Servers | Missing `ReadHeaderTimeout`; no graceful `Shutdown` |
-| Bodies | Unbounded `io.ReadAll` on request/response bodies |
+| Bodies | Unbounded `io.ReadAll`; unclosed or cancellation-abandoned response bodies |
 | Clients | No `Timeout`; `http.Get`/`DefaultClient`; `NewRequest` without context |
 | Security | Permissive CORS; open redirects; WebSocket `CheckOrigin` always true |
 

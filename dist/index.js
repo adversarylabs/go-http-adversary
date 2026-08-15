@@ -17168,6 +17168,18 @@ var domain = {
       recommendation: "After checking the request error, defer response.Body.Close before consuming the body; if the response is returned, make that ownership transfer explicit."
     },
     {
+      id: "go-http.cancelled-response-publication",
+      title: "Cancellation can abandon a concurrently published HTTP response",
+      concern: "HTTP responses abandoned by a cancellation/completion race",
+      category: "reliability",
+      severity: "medium",
+      confidence: "medium",
+      summary: (count) => `${count} HTTP response ownership path${count === 1 ? " can" : "s can"} return cancellation while a published body is ready but unobserved.`,
+      whyItMatters: "Go selects choose pseudo-randomly among ready cases, so cancellation can win even after a producer has published a response and signalled completion.",
+      impact: "The body owner can lose the response, retaining transport resources and preventing connection reuse.",
+      recommendation: "Establish ownership of late responses and synchronize with completion before returning, draining, or closing a concurrently published response."
+    },
+    {
       id: "go-http.graceful-shutdown",
       title: "The server lifecycle has no graceful shutdown path",
       concern: "HTTP servers without graceful shutdown",
@@ -21468,12 +21480,19 @@ async function analyzeDiscovery(discovery) {
     try {
       if (file.path.endsWith(".go")) {
         const tree = await parseGo(file.current);
+        const previousTree = file.previous === void 0 ? void 0 : await parseGo(file.previous);
         try {
           if (tree.rootNode.hasError) throw new Error("Go source contains syntax errors");
           signals.push(...responseWriterCapabilitySignals(file, tree.rootNode));
           signals.push(...providerResponseBufferSignals(file, tree.rootNode));
           signals.push(...clientResponseBodyCloseSignals(file, tree.rootNode));
+          signals.push(...cancelledResponsePublicationSignals(
+            file,
+            tree.rootNode,
+            previousTree?.rootNode.hasError === false ? previousTree.rootNode : void 0
+          ));
         } finally {
+          previousTree?.delete();
           tree.delete();
         }
       }
@@ -21492,6 +21511,769 @@ async function analyzeDiscovery(discovery) {
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path))
   };
+}
+function cancelledResponsePublicationSignals(file, root, previousRoot) {
+  const httpAliases = standardImportAliases(root, file.current, "net/http", "http");
+  const contextAliases = standardImportAliases(root, file.current, "context", "context");
+  if (httpAliases.size === 0 || contextAliases.size === 0) return [];
+  const lexicalFile = maskGoLexicalNoise(root, file.current);
+  const methods = descendants(root, "method_declaration");
+  const bodyConsumerPaths = standardBodyConsumerPaths(root, file.current);
+  const signals = [];
+  for (const state of ownedResponseStates(root, file.current, httpAliases, contextAliases)) {
+    const typeMethods = methods.filter((method) => methodReceiverType(method, file.current) === state.typeName);
+    const publishers = publishedResponses(state, typeMethods, lexicalFile, file.current);
+    const waiters = cancellationWaiters(state, typeMethods, lexicalFile, file.current);
+    for (const publisher of publishers) {
+      if (producerOwnsPublishedResponse(publisher, state, lexicalFile, file.current)) continue;
+      for (const waiter of waiters) {
+        if (cancellationCaseHandlesResponse(waiter, state, typeMethods, lexicalFile, file.current)) continue;
+        const owners = responseOwners(state, waiter, typeMethods, lexicalFile, file.current, bodyConsumerPaths);
+        for (const owner of owners) {
+          const evidence = firstChangedNode(file, root, previousRoot, [
+            state.responseDeclaration,
+            state.completionDeclaration,
+            publisher.asyncStart,
+            publisher.assignment,
+            publisher.signal,
+            waitReceiveNode(waiter.completionCase),
+            waitReceiveNode(waiter.cancellationCase),
+            waiter.cancellationReturn,
+            owner.waitCall,
+            owner.bodyUse
+          ]);
+          if (evidence === void 0) continue;
+          signals.push({
+            ruleId: "go-http.cancelled-response-publication",
+            path: file.path,
+            line: evidence.startPosition.row + 1,
+            endLine: evidence.endPosition.row + 1,
+            message: `${state.typeName}.${publisher.methodName} publishes ${state.responseField} before signalling ${state.completionField}, but ${state.typeName}.${waiter.methodName} can return cancellation without re-observing completion before ${state.typeName}.${owner.methodName} owns the response body.`,
+            snippet: sourceText(evidence, file.current).trim().slice(0, 300),
+            data: {
+              ownerType: state.typeName,
+              responseField: state.responseField,
+              completionField: state.completionField,
+              producer: publisher.methodName,
+              waiter: waiter.methodName,
+              responseOwner: owner.methodName,
+              publicationLine: publisher.assignment.startPosition.row + 1,
+              signalLine: publisher.signal.startPosition.row + 1,
+              cancellationLine: waiter.cancellationCase.startPosition.row + 1,
+              bodyOwnerLine: owner.bodyUse.startPosition.row + 1
+            }
+          });
+        }
+      }
+    }
+  }
+  return signals;
+}
+function ownedResponseStates(root, source, httpAliases, contextAliases) {
+  const states = [];
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const name2 = typeSpec.childForFieldName("name");
+    const type = typeSpec.childForFieldName("type");
+    if (name2 === null || type?.type !== "struct_type") continue;
+    const responseFields = [];
+    const completionFields = [];
+    const contextFields = /* @__PURE__ */ new Set();
+    for (const field of descendants(type, "field_declaration").filter(
+      (candidate) => sameSyntaxNode(candidate.parent?.parent ?? null, type)
+    )) {
+      const text = sourceText(field, source).replace(/\s+/g, " ").trim();
+      for (const alias of httpAliases) {
+        const response = new RegExp(
+          `^([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*)\\s+\\*\\s*${escapeRegExp(alias)}\\s*\\.\\s*Response$`
+        ).exec(text);
+        for (const fieldName of response?.[1]?.split(",").map((item) => item.trim()) ?? []) {
+          responseFields.push({ name: fieldName, node: field });
+        }
+      }
+      const completion = /^([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+chan\s+struct\s*\{\s*\}$/.exec(text);
+      for (const fieldName of completion?.[1]?.split(",").map((item) => item.trim()) ?? []) {
+        completionFields.push({ name: fieldName, node: field });
+      }
+      for (const alias of contextAliases) {
+        const context = new RegExp(
+          `^([A-Za-z_]\\w*(?:\\s*,\\s*[A-Za-z_]\\w*)*)\\s+${escapeRegExp(alias)}\\s*\\.\\s*Context$`
+        ).exec(text);
+        for (const fieldName of context?.[1]?.split(",").map((item) => item.trim()) ?? []) {
+          contextFields.add(fieldName);
+        }
+      }
+    }
+    for (const response of responseFields) {
+      for (const completion of completionFields) {
+        states.push({
+          typeName: sourceText(name2, source),
+          responseField: response.name,
+          responseDeclaration: response.node,
+          completionField: completion.name,
+          completionDeclaration: completion.node,
+          contextFields
+        });
+      }
+    }
+  }
+  return states;
+}
+function methodReceiverType(method, source) {
+  const receiver = method.childForFieldName("receiver");
+  if (receiver === null) return void 0;
+  return sourceText(receiver, source).match(/\(\s*[A-Za-z_]\w*\s+\*?\s*([A-Za-z_]\w*)\s*\)/)?.[1];
+}
+function methodName(method, source) {
+  const name2 = method.childForFieldName("name");
+  return name2 === null ? void 0 : sourceText(name2, source);
+}
+function publishedResponses(state, methods, lexicalFile, source) {
+  const publishers = [];
+  for (const method of methods) {
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    const assignments = descendants(body2, "assignment_statement").filter((node) => {
+      if (!sameSyntaxNode(owningFunction(node), method) || !directlyReachableInBlock(body2, node, lexicalFile)) return false;
+      const sides = assignmentSides(node);
+      return sides !== void 0 && pathEquals(selectorPath(sides.left, source), [receiver, state.responseField]);
+    }).sort((left, right) => left.startIndex - right.startIndex);
+    let assignment;
+    let signal;
+    for (const candidate of [...assignments].reverse()) {
+      if (expressionIsNil(assignmentSides(candidate)?.right)) continue;
+      const candidateSignal = producerSignalAfterPublication(method, candidate, receiver, state.completionField, lexicalFile);
+      if (candidateSignal === void 0) continue;
+      if (candidateSignal.type === "defer_statement") {
+        if (!sameSyntaxNode(assignments.at(-1) ?? null, candidate)) break;
+      } else if (assignments.some(
+        (later) => later.startIndex > candidate.endIndex && later.endIndex < candidateSignal.startIndex
+      )) continue;
+      assignment = candidate;
+      signal = candidateSignal;
+      break;
+    }
+    if (assignment === void 0 || signal === void 0) continue;
+    const asyncStart = asyncProducerStart(methods, method, name2, source);
+    if (asyncStart === void 0) continue;
+    publishers.push({ method, methodName: name2, receiver, assignment, signal, asyncStart });
+  }
+  return publishers;
+}
+function producerSignalAfterPublication(method, assignment, receiver, completionField, lexicalFile) {
+  const body2 = method.childForFieldName("body");
+  if (body2 === null) return void 0;
+  const deferred = descendants(body2, "defer_statement").find(
+    (node) => sameSyntaxNode(owningFunction(node), method) && directlyReachableInBlock(body2, node, lexicalFile) && descendants(node, "call_expression").some(
+      (call) => pathEquals(callPath(call, lexicalFile), ["close"]) && unshadowedBuiltin(call, "close", lexicalFile) && pathEquals(selectorPath(callArguments(call)[0], lexicalFile), [receiver, completionField])
+    )
+  );
+  if (deferred !== void 0) return deferred;
+  const candidates = [
+    ...descendants(body2, "expression_statement"),
+    ...descendants(body2, "send_statement")
+  ].filter((node) => sameSyntaxNode(owningFunction(node), method) && node.startIndex > assignment.endIndex);
+  return candidates.find((node) => {
+    if (!sameSyntaxNode(enclosingBlock(node), enclosingBlock(assignment))) return false;
+    if (!directlyReachableInBlock(body2, node, lexicalFile)) return false;
+    if (node.type === "send_statement") {
+      return pathEquals(selectorPath(node.namedChildren[0], lexicalFile), [receiver, completionField]);
+    }
+    return descendants(node, "call_expression").some(
+      (call) => pathEquals(callPath(call, lexicalFile), ["close"]) && unshadowedBuiltin(call, "close", lexicalFile) && pathEquals(selectorPath(callArguments(call)[0], lexicalFile), [receiver, completionField])
+    );
+  });
+}
+function asyncProducerStart(methods, producer, producerName, source) {
+  for (const method of methods) {
+    if (sameSyntaxNode(method, producer)) continue;
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    if (body2 === null || receiver === void 0) continue;
+    const start2 = descendants(body2, "go_statement").find(
+      (node) => sameSyntaxNode(owningFunction(node), method) && directlyReachableInBlock(body2, node, source) && descendants(node, "call_expression").some(
+        (call) => pathEquals(callPath(call, source), [receiver, producerName])
+      )
+    );
+    if (start2 !== void 0) return start2;
+  }
+  return void 0;
+}
+function cancellationWaiters(state, methods, lexicalSource, source) {
+  const waiters = [];
+  for (const method of methods) {
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    for (const select of descendants(body2, "select_statement")) {
+      if (!sameSyntaxNode(owningFunction(select), method) || !directlyReachableInBlock(body2, select, lexicalSource)) continue;
+      const cases = select.namedChildren.filter((child) => child.type === "communication_case");
+      const completionCase = cases.find(
+        (item) => communicationReceiveMatches(item, lexicalSource, receiver, state.completionField)
+      );
+      const cancellationCase = cases.find(
+        (item) => communicationReceivesContextDone(item, lexicalSource, receiver, state.contextFields)
+      );
+      if (completionCase === void 0 || cancellationCase === void 0) continue;
+      const cancellationReturn = descendants(cancellationCase, "return_statement").filter((item) => sameSyntaxNode(owningFunction(item), method)).sort((left, right) => left.startIndex - right.startIndex)[0];
+      if (cancellationReturn === void 0) continue;
+      waiters.push({
+        method,
+        methodName: name2,
+        receiver,
+        select,
+        completionCase,
+        cancellationCase,
+        cancellationReturn
+      });
+    }
+  }
+  return waiters;
+}
+function waitReceiveNode(caseNode) {
+  return caseNode.namedChildren.find((child) => child.type === "receive_statement") ?? caseNode;
+}
+function directCaseStatements(caseNode) {
+  return caseNode.namedChildren.find((child) => child.type === "statement_list")?.namedChildren ?? [];
+}
+function communicationReceiveMatches(caseNode, source, receiver, field) {
+  return pathEquals(receiveTargetPath(waitReceiveNode(caseNode), source), [receiver, field]);
+}
+function communicationReceivesContextDone(caseNode, source, receiver, contextFields) {
+  return [...contextFields].some(
+    (field) => pathEquals(receiveTargetPath(waitReceiveNode(caseNode), source), [receiver, field, "Done"])
+  );
+}
+function cancellationCaseHandlesResponse(waiter, state, methods, lexicalSource, source) {
+  const statements = waiter.cancellationCase.namedChildren.find((child) => child.type === "statement_list");
+  if (statements === void 0) return false;
+  const topLevel = directCaseStatements(waiter.cancellationCase);
+  const returnIndex = topLevel.findIndex((statement) => sameSyntaxNode(statement, waiter.cancellationReturn));
+  if (returnIndex < 0) return false;
+  return topLevel.slice(0, returnIndex).some((statement) => {
+    if (["expression_statement", "assignment_statement", "short_var_declaration"].includes(statement.type) && communicationReceiveTextMatches(statement, lexicalSource, waiter.receiver, state.completionField)) return true;
+    if (statement.type !== "expression_statement") return false;
+    return descendants(statement, "call_expression").some((call) => {
+      if (!sameSyntaxNode(owningFunction(call), waiter.method)) return false;
+      const path = callPath(call, lexicalSource);
+      if (path?.length !== 2 || path[0] !== waiter.receiver) return false;
+      const helper = methods.find((method) => methodName(method, source) === path[1]);
+      return helper !== void 0 && helperSynchronizesAndCloses(helper, state, lexicalSource, source);
+    });
+  });
+}
+function communicationReceiveTextMatches(node, source, receiver, field) {
+  return pathEquals(receiveTargetPath(node, source), [receiver, field]);
+}
+function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) {
+  const body2 = publisher.method.childForFieldName("body");
+  if (body2 === null) return false;
+  const assigned = unwrapExpression(assignmentSides(publisher.assignment)?.right);
+  const assignedName = assigned?.type === "identifier" ? sourceText(assigned, source) : void 0;
+  const directlyClosed = descendants(body2, "call_expression").some((call) => {
+    if (!sameSyntaxNode(owningFunction(call), publisher.method) || call.startIndex <= publisher.assignment.endIndex || !directlyReachableInBlock(body2, call, lexicalSource)) return false;
+    if (!sameSyntaxNode(enclosingBlock(call), enclosingBlock(publisher.assignment))) return false;
+    const path = callPath(call, lexicalSource);
+    return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) || assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]);
+  });
+  if (directlyClosed) return true;
+  return descendants(body2, "call_expression").some((invocation) => {
+    if (!sameSyntaxNode(owningFunction(invocation), publisher.method) || invocation.startIndex <= publisher.assignment.endIndex || !directlyReachableInBlock(body2, invocation, lexicalSource)) return false;
+    if (directStatementContaining(body2, invocation)?.type !== "expression_statement") return false;
+    const literal = invocation.childForFieldName("function");
+    if (literal?.type !== "func_literal" || callArguments(invocation).length !== 0) return false;
+    const literalBody = literal.childForFieldName("body");
+    if (literalBody === null) return false;
+    return descendants(literalBody, "call_expression").some((call) => {
+      if (!sameSyntaxNode(owningFunction(call), literal) || !directlyReachableInBlock(literalBody, call, lexicalSource)) return false;
+      const path = callPath(call, lexicalSource);
+      return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) || assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]);
+    });
+  });
+}
+function responseOwners(state, waiter, methods, lexicalSource, source, bodyConsumerPaths) {
+  const owners = [];
+  const wrappers = responseWaitWrappers(state, waiter, methods, lexicalSource, source);
+  for (const method of methods) {
+    if (sameSyntaxNode(method, waiter.method)) continue;
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    const waitCalls = descendants(body2, "call_expression").filter(
+      (call) => sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body2, call) && directlyReachableInBlock(body2, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
+    );
+    for (const waitCall of waitCalls) {
+      if (waitCallHasTerminatingErrorGuard(waitCall, lexicalSource)) continue;
+      const bodyUse = responseBodyUseAfter(body2, waitCall, [receiver, state.responseField], lexicalSource, bodyConsumerPaths);
+      if (bodyUse === void 0) continue;
+      if (!sameSyntaxNode(enclosingBlock(waitCall), enclosingBlock(bodyUse))) continue;
+      if (hasUnconditionalTerminationBetween(body2, waitCall, bodyUse, lexicalSource)) continue;
+      if (callerReobservesCompletion(body2, waitCall, bodyUse, receiver, state.completionField, lexicalSource)) continue;
+      owners.push({ method, methodName: name2, waitCall, bodyUse });
+    }
+    for (const wrapper of wrappers) {
+      for (const wrapperCall of descendants(body2, "call_expression").filter(
+        (call) => sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body2, call) && directlyReachableInBlock(body2, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, wrapper.name])
+      )) {
+        const responseName = assignedIdentifier(wrapperCall, source);
+        if (responseName === void 0) continue;
+        const bodyUse = responseBodyUseAfter(body2, wrapperCall, [responseName], lexicalSource, bodyConsumerPaths);
+        if (bodyUse === void 0 || !sameSyntaxNode(enclosingBlock(wrapperCall), enclosingBlock(bodyUse))) continue;
+        if (hasUnconditionalTerminationBetween(body2, wrapperCall, bodyUse, lexicalSource)) continue;
+        owners.push({ method, methodName: name2, waitCall: wrapperCall, bodyUse });
+      }
+    }
+  }
+  return owners;
+}
+function responseBodyUseAfter(body2, waitCall, responsePath, source, bodyConsumerPaths) {
+  return descendants(body2, "call_expression").find((call) => {
+    if (call.startIndex <= waitCall.endIndex || !sameSyntaxNode(owningFunction(call), owningFunction(waitCall)) || !directlyReachableInBlock(body2, call, source)) return false;
+    const path = callPath(call, source);
+    const bodyPath = [...responsePath, "Body"];
+    if (pathEquals(path, [...bodyPath, "Close"]) || pathEquals(path, [...bodyPath, "Read"])) return true;
+    if (path === void 0 || !bodyConsumerPaths.has(path.join("."))) return false;
+    return callArguments(call).some((argument) => pathEquals(selectorPath(argument, source), bodyPath));
+  });
+}
+function callerReobservesCompletion(body2, waitCall, bodyUse, receiver, completionField, source) {
+  return [...descendants(body2, "receive_statement"), ...descendants(body2, "expression_statement")].some(
+    (receive) => sameSyntaxNode(owningFunction(receive), owningFunction(waitCall)) && sameSyntaxNode(enclosingBlock(receive), enclosingBlock(waitCall)) && receive.startIndex > waitCall.endIndex && receive.endIndex < bodyUse.startIndex && communicationReceiveTextMatches(receive, source, receiver, completionField)
+  );
+}
+function waitCallHasTerminatingErrorGuard(waitCall, source) {
+  let current = waitCall.parent;
+  while (current !== null && current.type !== "if_statement") {
+    if (current.type === "statement_list" || current.type === "block") return false;
+    current = current.parent;
+  }
+  if (current === null) return false;
+  const initializer = current.namedChildren.find((child) => child.type === "short_var_declaration");
+  const consequence = current.namedChildren.find((child) => child.type === "block");
+  if (initializer === void 0 || consequence === void 0 || !containsNode(initializer, waitCall)) return false;
+  const sides = assignmentSides(initializer);
+  if (sides?.left.type !== "identifier") return false;
+  const errorName = sourceText(sides.left, source).trim();
+  const condition = current.namedChildren.find((child) => child.type === "binary_expression");
+  if (condition === void 0 || sourceText(condition, source).replace(/\s/g, "") !== `${errorName}!=nil`) return false;
+  return topLevelStatements(consequence).some((statement) => statement.type === "return_statement");
+}
+function responseWaitWrappers(state, waiter, methods, lexicalSource, source) {
+  const wrappers = [];
+  for (const method of methods) {
+    if (sameSyntaxNode(method, waiter.method)) continue;
+    const body2 = method.childForFieldName("body");
+    const receiver = methodReceiverName(method, source);
+    const name2 = methodName(method, source);
+    if (body2 === null || receiver === void 0 || name2 === void 0) continue;
+    const waitCall = descendants(body2, "call_expression").find(
+      (call) => sameSyntaxNode(owningFunction(call), method) && directlyReachableInBlock(body2, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
+    );
+    if (waitCall === void 0) continue;
+    const responseReturn = descendants(body2, "return_statement").find(
+      (statement) => sameSyntaxNode(owningFunction(statement), method) && directlyReachableInBlock(body2, statement, lexicalSource) && statement.startIndex > waitCall.endIndex && statement.namedChildren.some((child) => pathEquals(selectorPath(child, lexicalSource), [receiver, state.responseField]))
+    );
+    if (responseReturn === void 0 || hasUnconditionalTerminationBetween(body2, waitCall, responseReturn, lexicalSource)) continue;
+    if (callerReobservesCompletion(body2, waitCall, responseReturn, receiver, state.completionField, lexicalSource)) continue;
+    wrappers.push({ name: name2 });
+  }
+  return wrappers;
+}
+function helperSynchronizesAndCloses(method, state, lexicalSource, source) {
+  const body2 = method.childForFieldName("body");
+  const receiver = methodReceiverName(method, source);
+  if (body2 === null || receiver === void 0) return false;
+  const statements = topLevelStatements(body2);
+  const receive = statements.find(
+    (statement) => communicationReceiveTextMatches(statement, lexicalSource, receiver, state.completionField)
+  );
+  if (receive === void 0 || !directlyReachableInBlock(body2, receive, lexicalSource)) return false;
+  const directClose = descendants(body2, "call_expression").some(
+    (call) => sameSyntaxNode(owningFunction(call), method) && call.startIndex > receive.endIndex && directlyReachableInBlock(body2, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, state.responseField, "Body", "Close"])
+  );
+  if (directClose) return true;
+  return statements.some((statement) => {
+    if (statement.type !== "if_statement" || statement.startIndex <= receive.endIndex || !directlyReachableInBlock(body2, statement, lexicalSource)) return false;
+    const condition = statement.childForFieldName("condition") ?? statement.namedChildren.find((child) => child.type === "binary_expression");
+    const consequence = statement.childForFieldName("consequence") ?? statement.namedChildren.find((child) => child.type === "block");
+    if (condition === null || condition === void 0 || consequence === null || consequence === void 0) return false;
+    const expected = `${receiver}.${state.responseField}!=nil`;
+    if (sourceText(condition, lexicalSource).replace(/\s/g, "") !== expected) return false;
+    return descendants(consequence, "call_expression").some(
+      (call) => sameSyntaxNode(owningFunction(call), method) && directlyReachableInBlock(consequence, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, state.responseField, "Body", "Close"])
+    );
+  });
+}
+function receiveTargetPath(node, source) {
+  const owner = owningFunction(node);
+  if (owner === null) return void 0;
+  const receive = [node, ...descendants(node, "unary_expression")].find(
+    (candidate) => candidate.type === "unary_expression" && sameSyntaxNode(owningFunction(candidate), owner) && sourceText(candidate, source).trimStart().startsWith("<-")
+  );
+  const operand = receive?.namedChildren[0];
+  if (operand === void 0) return void 0;
+  const unwrapped = unwrapExpression(operand);
+  return unwrapped?.type === "call_expression" ? callPath(unwrapped, source) : selectorPath(unwrapped, source);
+}
+function standardBodyConsumerPaths(root, source) {
+  const paths = /* @__PURE__ */ new Set();
+  for (const alias of standardImportAliases(root, source, "io", "io")) {
+    for (const name2 of ["ReadAll", "Copy", "CopyBuffer"]) paths.add(`${alias}.${name2}`);
+  }
+  for (const module2 of ["encoding/json", "encoding/xml"]) {
+    const fallback = module2.split("/").at(-1);
+    for (const alias of standardImportAliases(root, source, module2, fallback)) paths.add(`${alias}.NewDecoder`);
+  }
+  return paths;
+}
+function selectorPath(node, source) {
+  if (node === void 0 || node === null) return void 0;
+  if (node.type === "identifier") return [sourceText(node, source).trim()];
+  if (node.type === "selector_expression") {
+    const operand = selectorPath(node.childForFieldName("operand"), source);
+    const field = node.childForFieldName("field");
+    return operand === void 0 || field === null ? void 0 : [...operand, sourceText(field, source).trim()];
+  }
+  if (node.type === "parenthesized_expression" && node.namedChildren.length === 1) {
+    return selectorPath(node.namedChildren[0], source);
+  }
+  if (node.type === "expression_list" && node.namedChildren.length === 1) {
+    return selectorPath(node.namedChildren[0], source);
+  }
+  return void 0;
+}
+function callPath(call, source) {
+  if (call.type !== "call_expression") return void 0;
+  return selectorPath(call.childForFieldName("function"), source);
+}
+function callArguments(call) {
+  return call.childForFieldName("arguments")?.namedChildren ?? [];
+}
+function pathEquals(actual, expected) {
+  return actual !== void 0 && actual.length === expected.length && actual.every((part, index) => part === expected[index]);
+}
+function assignmentSides(statement) {
+  const rawLeft = statement.childForFieldName("left") ?? statement.namedChildren[0];
+  const rawRight = statement.childForFieldName("right") ?? statement.namedChildren.at(-1);
+  const left = rawLeft?.type === "expression_list" && rawLeft.namedChildren.length === 1 ? rawLeft.namedChildren[0] : rawLeft;
+  const right = rawRight?.type === "expression_list" && rawRight.namedChildren.length === 1 ? rawRight.namedChildren[0] : rawRight;
+  return left === void 0 || right === void 0 ? void 0 : { left, right };
+}
+function unwrapExpression(node) {
+  let current = node ?? void 0;
+  while (current !== void 0 && (current.type === "parenthesized_expression" || current.type === "expression_list") && current.namedChildren.length === 1) {
+    current = current.namedChildren[0];
+  }
+  return current;
+}
+function expressionIsNil(node) {
+  return unwrapExpression(node)?.type === "nil";
+}
+function assignedIdentifier(call, source) {
+  let current = call.parent;
+  while (current !== null && current.type !== "assignment_statement" && current.type !== "short_var_declaration") {
+    if (current.type === "statement_list" || current.type === "block") return void 0;
+    current = current.parent;
+  }
+  if (current === null) return void 0;
+  const sides = assignmentSides(current);
+  return sides?.left.type === "identifier" ? sourceText(sides.left, source).trim() : void 0;
+}
+function isDirectStatement(block, node) {
+  let current = node;
+  while (current !== null && current.parent !== null) {
+    if (current.parent.type === "statement_list") return sameSyntaxNode(current.parent.parent, block);
+    current = current.parent;
+  }
+  return false;
+}
+function directlyReachableInBlock(block, node, source) {
+  if (!containsNode(block, node)) return false;
+  const expressionCase = enclosingExpressionCase(node, block);
+  if (expressionCase !== void 0) {
+    const statements = expressionCase.namedChildren.find((child) => child.type === "statement_list");
+    const statement = statements?.namedChildren.find((candidate) => containsNode(candidate, node));
+    if (statements === void 0 || statement === void 0 || !expressionCaseCanExecute(expressionCase, source)) return false;
+    if (statements.namedChildren.some(
+      (candidate) => candidate.endIndex < statement.startIndex && unconditionallyTerminatesBefore(statements, candidate, statement, source)
+    )) return false;
+    return directlyReachableInBlock(block, expressionCase, source);
+  }
+  let target = node;
+  let currentBlock = enclosingBlock(node);
+  while (currentBlock !== null) {
+    const scope = currentBlock;
+    const statement = directStatementContaining(scope, target);
+    if (statement === void 0) return false;
+    if (topLevelStatements(scope).some(
+      (candidate) => candidate.endIndex < statement.startIndex && unconditionallyTerminatesBefore(scope, candidate, statement, source)
+    )) return false;
+    if (sameSyntaxNode(scope, block)) return true;
+    if (!nestedBlockCanExecute(scope, source)) return false;
+    target = scope;
+    currentBlock = enclosingBlock(scope);
+  }
+  return false;
+}
+function enclosingExpressionCase(node, boundary) {
+  let current = node.parent;
+  while (current !== null && !sameSyntaxNode(current, boundary)) {
+    if (current.type === "expression_case") return current;
+    current = current.parent;
+  }
+  return void 0;
+}
+function expressionCaseCanExecute(expressionCase, source) {
+  const expressionSwitch = expressionCase.parent;
+  if (expressionSwitch?.type !== "expression_switch_statement") return true;
+  const switchValue = booleanLiteral(expressionSwitch.childForFieldName("value"), source);
+  const caseValue = booleanLiteral(expressionCase.childForFieldName("value"), source);
+  return switchValue === void 0 || caseValue === void 0 || switchValue === caseValue;
+}
+function nestedBlockCanExecute(block, source) {
+  let controller = block.parent;
+  if (controller?.type === "else_clause") controller = controller.parent;
+  if (controller === null) return false;
+  if (controller?.type === "if_statement") {
+    const condition = booleanLiteral(controller.childForFieldName("condition"), source);
+    const consequence = controller.childForFieldName("consequence");
+    if (consequence !== null && containsNode(consequence, block) && condition === false) return false;
+    const alternative = controller.childForFieldName("alternative");
+    if (alternative !== null && containsNode(alternative, block) && condition === true) return false;
+  }
+  if (controller?.type === "for_statement") {
+    if (booleanLiteral(controller.childForFieldName("condition"), source) === false) return false;
+  }
+  return true;
+}
+function booleanLiteral(node, source) {
+  const expression = unwrapExpression(node);
+  if (expression?.type === "true") return true;
+  if (expression?.type === "false") return false;
+  return void 0;
+}
+function unconditionallyTerminatesBefore(block, candidate, target, source) {
+  if (candidate.type === "labeled_statement") {
+    const nested = candidate.namedChildren.find((child) => child.type !== "label_name");
+    return nested !== void 0 && unconditionallyTerminatesBefore(block, nested, target, source);
+  }
+  if (candidate.type === "return_statement") return true;
+  if (candidate.type === "goto_statement") {
+    const label = candidate.namedChildren.find((child) => child.type === "label_name");
+    if (label === void 0) return true;
+    const name2 = sourceText(label, source);
+    const destination = topLevelStatements(block).find((statement) => {
+      const destinationLabel = statement.childForFieldName("label");
+      return statement.type === "labeled_statement" && destinationLabel !== null && sourceText(destinationLabel, source) === name2;
+    });
+    if (destination === void 0) return true;
+    return destination.startIndex < candidate.startIndex || destination.startIndex > target.startIndex;
+  }
+  if (candidate.type !== "expression_statement") return false;
+  const expression = unwrapExpression(candidate.namedChildren[0]);
+  return expression?.type === "call_expression" && pathEquals(callPath(expression, source), ["panic"]) && unshadowedBuiltin(expression, "panic", source);
+}
+function unshadowedBuiltin(use, name2, source) {
+  let root = use;
+  while (root.parent !== null) root = root.parent;
+  for (const declaration of descendants(root, "function_declaration")) {
+    const declared = declaration.childForFieldName("name");
+    if (declared !== null && sourceText(declared, source) === name2) return false;
+  }
+  for (const declaration of [...descendants(root, "type_spec"), ...descendants(root, "var_spec"), ...descendants(root, "const_spec")]) {
+    if (owningFunction(declaration) !== null) continue;
+    if (declarationNames(declaration, source).has(name2)) return false;
+  }
+  for (const spec of descendants(root, "import_spec")) {
+    if (new RegExp(`^${escapeRegExp(name2)}\\s+["\`]`).test(sourceText(spec, source).trim())) return false;
+  }
+  const owner = owningFunction(use);
+  if (owner === null) return true;
+  const body2 = owner.childForFieldName("body");
+  const signature = source.slice(owner.startIndex, body2?.startIndex ?? owner.endIndex);
+  if (new RegExp(`(?:\\(|,)\\s*${escapeRegExp(name2)}(?:\\s|,)`).test(signature)) return false;
+  for (const declaration of [
+    ...descendants(owner, "short_var_declaration"),
+    ...descendants(owner, "var_spec"),
+    ...descendants(owner, "const_spec")
+  ]) {
+    if (declaration.startIndex >= use.startIndex || !sameSyntaxNode(owningFunction(declaration), owner)) continue;
+    if (!declarationNames(declaration, source).has(name2)) continue;
+    const scope = enclosingBlock(declaration);
+    if (scope !== null && containsNode(scope, use)) return false;
+  }
+  return true;
+}
+function declarationNames(node, source) {
+  let candidate = node;
+  if (node.type === "short_var_declaration") candidate = node.childForFieldName("left") ?? node.namedChildren[0] ?? node;
+  const text = sourceText(candidate, source).split(/:=|=|\s+(?=[A-Za-z_*\[])/, 1)[0] ?? "";
+  return new Set(text.split(",").map((part) => part.trim()).filter((part) => /^[A-Za-z_]\w*$/.test(part)));
+}
+function directStatementContaining(block, node) {
+  let current = node;
+  while (current !== null && current.parent !== null) {
+    if (current.parent.type === "statement_list") {
+      return sameSyntaxNode(current.parent.parent, block) ? current : void 0;
+    }
+    current = current.parent;
+  }
+  return void 0;
+}
+function hasUnconditionalTerminationBetween(block, before, after, source) {
+  const beforeStatement = directStatementContaining(block, before);
+  const afterStatement = directStatementContaining(block, after);
+  if (beforeStatement === void 0 || afterStatement === void 0) return true;
+  return topLevelStatements(block).some(
+    (statement) => statement.startIndex > beforeStatement.endIndex && statement.endIndex < afterStatement.startIndex && unconditionallyTerminatesBefore(block, statement, afterStatement, source)
+  );
+}
+function containsNode(container, candidate) {
+  return candidate.startIndex >= container.startIndex && candidate.endIndex <= container.endIndex;
+}
+function enclosingBlock(node) {
+  let current = node.parent;
+  while (current !== null) {
+    if (current.type === "block") return current;
+    current = current.parent;
+  }
+  return null;
+}
+function firstChangedNode(file, root, previousRoot, nodes) {
+  return nodes.find((node) => nodeSemanticallyChanged(file, root, previousRoot, node));
+}
+function nodeSemanticallyChanged(file, root, previousRoot, node) {
+  const line = node.startPosition.row + 1;
+  const endLine = node.endPosition.row + 1;
+  if (!changed(file, line, endLine)) return false;
+  if (file.status !== "modified" || file.previous === void 0 || previousRoot === void 0) {
+    return semanticallyChanged(file, line, endLine);
+  }
+  const previousNode = correspondingPreviousNode(root, previousRoot, node, file.current, file.previous);
+  if (previousNode !== void 0 && previousNode.type === node.type) {
+    return goSourceSemantics(sourceText(node, file.current)) !== goSourceSemantics(sourceText(previousNode, file.previous));
+  }
+  return semanticallyChanged(file, line, endLine);
+}
+function correspondingPreviousNode(root, previousRoot, node, currentSource, previousSource) {
+  const owner = enclosingNamedDeclaration(node) ?? root;
+  const identity = declarationIdentity(owner, currentSource);
+  if (identity === void 0) return void 0;
+  const previousOwner = owner.type === "source_file" ? previousRoot : descendants(previousRoot, owner.type).find(
+    (candidate) => declarationIdentity(candidate, previousSource) === identity
+  );
+  if (previousOwner === void 0) return void 0;
+  const path = [];
+  let current = node;
+  while (!sameSyntaxNode(current, owner)) {
+    const parent = current.parent;
+    if (parent === null) return void 0;
+    const siblings = semanticNamedChildren(parent);
+    const index = siblings.findIndex((candidate) => sameSyntaxNode(candidate, current));
+    if (index < 0) return void 0;
+    path.unshift(index);
+    current = parent;
+  }
+  let previous = previousOwner;
+  for (const index of path) {
+    previous = semanticNamedChildren(previous)[index];
+    if (previous === void 0) return void 0;
+  }
+  return previous;
+}
+function enclosingNamedDeclaration(node) {
+  let current = node;
+  while (current !== null) {
+    if (["method_declaration", "function_declaration", "type_spec"].includes(current.type)) return current;
+    current = current.parent;
+  }
+  return void 0;
+}
+function declarationIdentity(node, source) {
+  if (node.type === "source_file") return "source_file";
+  const name2 = node.childForFieldName("name");
+  if (name2 === null) return void 0;
+  if (node.type === "method_declaration") {
+    const receiver = methodReceiverType(node, source);
+    return receiver === void 0 ? void 0 : `${node.type}:${receiver}.${sourceText(name2, source)}`;
+  }
+  return `${node.type}:${sourceText(name2, source)}`;
+}
+function semanticNamedChildren(node) {
+  return node.namedChildren.filter((child) => child.type !== "comment");
+}
+function semanticallyChanged(file, line, endLine = line) {
+  if (!changed(file, line, endLine)) return false;
+  if (file.status !== "modified") return true;
+  const currentLines = file.current.split("\n");
+  if (file.previous === void 0) {
+    return [...file.changedLines].some(
+      (candidate) => candidate >= line && candidate <= endLine && !hasInlineGoComment(currentLines[candidate - 1] ?? "")
+    );
+  }
+  if (goSourceSemantics(file.current) === goSourceSemantics(file.previous)) return false;
+  const previousLines = file.previous.split("\n");
+  for (let candidate = line; candidate <= endLine; candidate += 1) {
+    if (!file.changedLines.has(candidate)) continue;
+    const current = goLineSemantics(currentLines[candidate - 1] ?? "");
+    const previous = goLineSemantics(previousLines[candidate - 1] ?? "");
+    if (current !== previous) return true;
+  }
+  return false;
+}
+function hasInlineGoComment(line) {
+  return goLineSemantics(line) !== line.replace(/\s+/g, "").trim();
+}
+function goLineSemantics(line) {
+  return goSourceSemantics(line);
+}
+function goSourceSemantics(source) {
+  let quote;
+  let escaped = false;
+  let blockComment = false;
+  let lineComment = false;
+  let semantic = "";
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (character === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote === void 0 && character === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (quote === void 0 && character === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    semantic += character;
+    if (quote === "`") {
+      if (character === "`") quote = void 0;
+      continue;
+    }
+    if (quote !== void 0) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === quote) quote = void 0;
+      continue;
+    }
+    if (character === '"' || character === "'" || character === "`") quote = character;
+  }
+  return semantic.replace(/\s+/g, "").trim();
 }
 function providerResponseBufferSignals(file, root) {
   const lexicalFile = maskGoLexicalNoise(root, file.current);
@@ -21669,6 +22451,7 @@ function writeHasProvenBound(writeMethod, accumulatingWrite, source, writeReceiv
   return false;
 }
 function topLevelStatements(block) {
+  if (block.type === "statement_list") return block.namedChildren;
   return [...block.namedChildren].find((child) => child.type === "statement_list")?.namedChildren ?? [];
 }
 function hasUnconditionalTopLevelReturn(block) {
@@ -21769,12 +22552,12 @@ function responseWriterCallbackInterfaces(root, source, httpAliases) {
     const type = typeSpec.childForFieldName("type");
     if (name2 === null || type?.type !== "interface_type") continue;
     for (const method of descendants(type, "method_elem")) {
-      const methodName = method.childForFieldName("name");
+      const methodName2 = method.childForFieldName("name");
       const parameters = directParameterList(method);
-      if (methodName === null || parameters === void 0) continue;
+      if (methodName2 === null || parameters === void 0) continue;
       const positions = responseWriterParameterPositions(parameters, source, httpAliases);
       if (positions.size === 0) continue;
-      addCallbackContract(callbacks, sourceText(name2, source), sourceText(methodName, source), positions);
+      addCallbackContract(callbacks, sourceText(name2, source), sourceText(methodName2, source), positions);
     }
   }
   return callbacks;
@@ -21985,10 +22768,10 @@ function responseWriterCapabilitySignals(file, root) {
     const declaredMethods = /* @__PURE__ */ new Set();
     for (const method of methods) {
       const receiver = method.childForFieldName("receiver");
-      const methodName = method.childForFieldName("name");
-      if (receiver === null || methodName === null) continue;
+      const methodName2 = method.childForFieldName("name");
+      if (receiver === null || methodName2 === null) continue;
       if (!new RegExp(`\\b${escapeRegExp(typeName)}\\b`).test(sourceText(receiver, file.current))) continue;
-      declaredMethods.add(sourceText(methodName, file.current));
+      declaredMethods.add(sourceText(methodName2, file.current));
     }
     const missing = claim.capabilities.filter(
       (capability) => capability === "Flusher" ? !declaredMethods.has("Flush") : !declaredMethods.has("Hijack")
@@ -22075,6 +22858,7 @@ async function discoverSources(ctx) {
     files.push({
       path: source.path,
       current: source.content,
+      ...change.previous === void 0 ? {} : { previous: change.previous },
       changedLines: change.changedLines,
       status: change.status
     });
@@ -22095,7 +22879,8 @@ async function changedSource(ctx, path) {
   if (head !== void 0 && !ctx.change?.worktree) args2.push(head);
   args2.push("--", path);
   const patch = await gitOutput(ctx.repoPath, args2);
-  return { changedLines: changedLineNumbers(patch), status: "modified" };
+  const previous = await gitOutput(ctx.repoPath, ["show", `${base}:${path}`]);
+  return { changedLines: changedLineNumbers(patch), status: "modified", previous };
 }
 async function existsAtRevision(repoPath, revision, path) {
   try {
@@ -22135,6 +22920,7 @@ Authority:
 - server timeouts and graceful Shutdown (including long-lived local callback servers)
 - handler request bodies (r.Body) needing MaxBytesReader with a size class
 - client response bodies (resp.Body) needing LimitReader with a size class (token JSON vs metadata)
+- response ownership across cancellation/completion races, but only when prepared evidence proves a typed *http.Response publication, its completion signal, and a real body owner
 - ResponseWriter intermediaries that accumulate output produced by a provider, plugin, or downstream callback: require a proven hard cap, bounded upstream contract, streaming/backpressure, or spill strategy; cite both the callback boundary and accumulation
 - outbound http.Client timeouts and request contexts
 - DefaultClient / http.Get/Post without deadlines
@@ -22145,6 +22931,7 @@ Hard exclusions \u2014 do NOT file unbounded-body findings for:
 - Local OCI store / file reads that are not HTTP
 - test recorders, intrinsically bounded fixed responses, or callbacks whose hard output cap is established in prepared source
 - ordinary streaming to the real ResponseWriter and bounded in-memory assembly that is not callback-controlled
+- cancellation paths that synchronize with completion before cleanup, producer-owned body cleanup, a proven no-late-publication or ownership-transfer protocol, or code without the complete publication-to-owner relationship
 - *_test.go noise
 
 Never label CLI stdin as an "attacker-controlled request body" unless it is an HTTP server handler.
@@ -22203,6 +22990,7 @@ var GO_HTTP_MODEL_SCHEMA = {
               "client-response-limit",
               "body-limit",
               "provider-output-limit",
+              "response-ownership",
               "graceful-shutdown",
               "client-timeout",
               "request-context",
@@ -22608,7 +23396,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.17",
+    version: "0.0.18",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {

@@ -76,6 +76,22 @@ export const domain: DomainDefinition = {
         "After checking the request error, defer response.Body.Close before consuming the body; if the response is returned, make that ownership transfer explicit.",
     },
     {
+      id: "go-http.cancelled-response-publication",
+      title: "Cancellation can abandon a concurrently published HTTP response",
+      concern: "HTTP responses abandoned by a cancellation/completion race",
+      category: "reliability",
+      severity: "medium",
+      confidence: "medium",
+      summary: (count) =>
+        `${count} HTTP response ownership path${count === 1 ? " can" : "s can"} return cancellation while a published body is ready but unobserved.`,
+      whyItMatters:
+        "Go selects choose pseudo-randomly among ready cases, so cancellation can win even after a producer has published a response and signalled completion.",
+      impact:
+        "The body owner can lose the response, retaining transport resources and preventing connection reuse.",
+      recommendation:
+        "Establish ownership of late responses and synchronize with completion before returning, draining, or closing a concurrently published response.",
+    },
+    {
       id: "go-http.graceful-shutdown",
       title: "The server lifecycle has no graceful shutdown path",
       concern: "HTTP servers without graceful shutdown",

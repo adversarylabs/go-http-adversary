@@ -1,5 +1,5 @@
 name: go/http
-version: 0.0.17
+version: 0.0.18
 description: Reviews Go HTTP services for bounded requests, safe middleware, and production-ready server lifecycle.
 
 triggers:

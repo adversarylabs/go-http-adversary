@@ -93,6 +93,16 @@ Regression entry: graded fixtures and corpus under `test/`.
 | **Stays quiet when** | The writer enforces a hard cap, the prepared source establishes an upstream maximum, output is streamed/backpressured or spilled, the recorder is internal/test-only, or no callback boundary is proven |
 | **Remediation** | Enforce an endpoint-appropriate response cap or use streaming/backpressure/spill-to-disk for legitimately large output |
 
+### `go-http.cancelled-response-publication`
+
+| | |
+| --- | --- |
+| **What** | A background producer publishes a `*http.Response` before signalling completion, while a response-body owner can return from a competing cancellation case without observing the ready response |
+| **Why** | Go may select cancellation even when completion is also ready, abandoning the body and retaining transport resources |
+| **Looks for** | One struct's typed response and completion channel, an asynchronously-started producer's ordered publish/signal, a waiter selecting completion versus `ctx.Done()`, and a caller that consumes or closes the body |
+| **Stays quiet when** | The cancellation arm or owning wrapper synchronizes with completion before cleanup; the producer closes the response; no late publication is possible; ownership is explicitly transferred by a proven protocol; or the full relationship is not proven |
+| **Remediation** | Establish who owns late responses, then synchronize with completion before returning, draining, or closing a concurrently published response |
+
 ### `go-http.graceful-shutdown`
 
 | | |
