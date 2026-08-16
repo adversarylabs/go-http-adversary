@@ -1,43 +1,21 @@
-# go/http
+# Go HTTP adversary
 
-**go/http** reviews Go HTTP services and clients for **bounded requests, safe middleware defaults, and production-ready server/client lifecycle** across `net/http`, Gin, Chi, Echo, Fiber, and framework-neutral middleware.
+Reviews Go HTTP services for bounded requests, safe middleware, and production-ready server lifecycle.
 
-It is an **HTTP domain reviewer**, not a general web app scanner. It prefers silence over framework style. When it reports, production servers or outbound clients can hang, OOM, or leak security boundaries.
+## Goals
 
-## What it does
+The adversary is designed to produce a small number of high-confidence,
+actionable findings grounded in concrete repository evidence. Its review should
+be deterministic where possible, explicit about impact, and quiet when the
+available evidence does not justify a finding.
 
-1. **Discovers** non-test Go files (`*.go`, excluding `*_test.go`).
-2. **Runs deterministic detectors** for timeouts, body bounds, shutdown, CORS, redirects, and WebSocket origin.
-3. **Synthesizes a review** with production impact.
-4. Optionally **enhances** with a model when provided.
+## Scope
 
-It never executes the scanned project as the product under review, never installs dependencies into it, and never needs network access to the target repository.
+It evaluates changed Go HTTP client and server code for timeouts, cancellation, body ownership, buffering limits, redirects, CORS, shutdown, and protocol capabilities.
 
-## What it detects
+The complete detector or review inventory is maintained in
+[CHECKS.md](CHECKS.md).
 
-Every **shipped rule id**, severity, and short description lives in **[CHECKS.md](CHECKS.md)** — the audit surface for “what does this adversary look for?”
+## Boundaries
 
-Highlights:
-
-| Area | Examples |
-| --- | --- |
-| Servers | Missing `ReadHeaderTimeout`; no graceful `Shutdown` |
-| Bodies | Unbounded `io.ReadAll`; unclosed or cancellation-abandoned response bodies |
-| Clients | No `Timeout`; `http.Get`/`DefaultClient`; `NewRequest` without context |
-| Security | Permissive CORS; open redirects; WebSocket `CheckOrigin` always true |
-
-### Ownership boundaries
-
-Other official adversaries own adjacent classes so findings stay non-duplicative:
-
-| Concern | Owned by |
-| --- | --- |
-| TLS skip-verify, JWT, path traversal, generic crypto | [`go/security`](https://github.com/adversarylabs/go-security-adversary) |
-| CLI process ownership and subprocess cancel | [`go/cli`](https://github.com/adversarylabs/go-cli-adversary) |
-| DB pool/rows lifecycle | [`go/database`](https://github.com/adversarylabs/go-database-adversary) |
-
-## Precision stance
-
-- **High confidence** only for deterministic, evidence-backed patterns.
-- Clean fixtures must stay quiet; vulnerable fixtures must fire where graded fixtures exist.
-- Prefer missing a weak signal over a false positive on normal production code.
+It owns only this Go specialty. Other Go concerns remain with the corresponding `go/*` adversaries, and it does not execute or modify the target repository.
