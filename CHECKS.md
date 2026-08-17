@@ -1,144 +1,18 @@
-# Checks — what go/http detects
+# Checks
 
-This file is the **public audit list** of detectors. If a rule id appears here, it is part of the product surface: it should fire on a vulnerable pattern, stay quiet on the documented clean case, and produce file:line evidence where applicable.
-
-Runtime source of truth: [`src/domain.ts`](src/domain.ts).
-Regression entry: graded fixtures and corpus under `test/`.
-
-**Scope:** non-test `*.go` files in HTTP services and clients.
-
----
-
-## High
-
-### `go-http.server-timeouts`
-
-| | |
-| --- | --- |
-| **What** | HTTP server missing header-read timeout |
-| **Why** | Slowloris-style connection retention |
-| **Looks for** | `http.Server` / ListenAndServe without ReadHeaderTimeout |
-| **Stays quiet when** | Explicit Server with ReadHeaderTimeout (+ read/write/idle as needed) |
-| **Remediation** | Always set ReadHeaderTimeout on internet-facing servers |
-
-### `go-http.handler-body-limit`
-
-| | |
-| --- | --- |
-| **What** | Handler buffers request body without limit |
-| **Why** | Attacker-controlled body can OOM |
-| **Looks for** | `io.ReadAll(r.Body)` without MaxBytesReader |
-| **Stays quiet when** | http.MaxBytesReader before decode |
-| **Remediation** | Bound every request body read |
-
-### `go-http.client-no-timeout`
-
-| | |
-| --- | --- |
-| **What** | HTTP client has no timeout budget |
-| **Why** | Hung peers wedge workers |
-| **Looks for** | `http.Client` without Timeout |
-| **Stays quiet when** | Set Client.Timeout or per-request deadlines |
-| **Remediation** | Never ship a client without a deadline |
-
-### `go-http.cors-permissive`
-
-| | |
-| --- | --- |
-| **What** | CORS allows overly broad origins/methods |
-| **Why** | Browser-side cross-origin abuse |
-| **Looks for** | Access-Control-Allow-Origin: * with credentials or wildcard patterns |
-| **Stays quiet when** | Explicit allowlist |
-| **Remediation** | Never combine * with credentials |
-
-### `go-http.redirect-open`
-
-| | |
-| --- | --- |
-| **What** | Open redirect on untrusted next URL |
-| **Why** | Phishing / token theft via redirects |
-| **Looks for** | Redirect to query/header URL without allowlist |
-| **Stays quiet when** | Allowlisted hosts only |
-| **Remediation** | Validate redirect targets |
-
-### `go-http.websocket-origin`
-
-| | |
-| --- | --- |
-| **What** | WebSocket CheckOrigin always allows |
-| **Why** | CSWSH from malicious origins |
-| **Looks for** | CheckOrigin: return true |
-| **Stays quiet when** | Origin allowlist |
-| **Remediation** | Validate Origin before upgrade |
-
-## Medium
-
-### `go-http.client-response-limit`
-
-| | |
-| --- | --- |
-| **What** | Client buffers response without size limit |
-| **Why** | Peer can return huge bodies |
-| **Looks for** | `io.ReadAll(resp.Body)` unbounded |
-| **Stays quiet when** | io.LimitReader with size class |
-| **Remediation** | Bound response reads |
-
-### `go-http.provider-response-buffer-limit`
-
-| | |
-| --- | --- |
-| **What** | A production `http.ResponseWriter` substitute accumulates body data written by a provider, plugin, or downstream callback without a proven bound |
-| **Why** | The callback controls output volume, so the intermediary can grow the process heap until failure |
-| **Looks for** | A ResponseWriter-shaped type with a `bytes.Buffer`-backed `Write`, instantiated and passed across a provider/downstream callback boundary |
-| **Stays quiet when** | The writer enforces a hard cap, the prepared source establishes an upstream maximum, output is streamed/backpressured or spilled, the recorder is internal/test-only, or no callback boundary is proven |
-| **Remediation** | Enforce an endpoint-appropriate response cap or use streaming/backpressure/spill-to-disk for legitimately large output |
-
-### `go-http.cancelled-response-publication`
-
-| | |
-| --- | --- |
-| **What** | A background producer publishes a `*http.Response` before signalling completion, while a response-body owner can return from a competing cancellation case without observing the ready response |
-| **Why** | Go may select cancellation even when completion is also ready, abandoning the body and retaining transport resources |
-| **Looks for** | One struct's typed response and completion channel, an asynchronously-started producer's ordered publish/signal, a waiter selecting completion versus `ctx.Done()`, and a caller that consumes or closes the body |
-| **Stays quiet when** | The cancellation arm or owning wrapper synchronizes with completion before cleanup; the producer closes the response; no late publication is possible; ownership is explicitly transferred by a proven protocol; or the full relationship is not proven |
-| **Remediation** | Establish who owns late responses, then synchronize with completion before returning, draining, or closing a concurrently published response |
-
-### `go-http.graceful-shutdown`
-
-| | |
-| --- | --- |
-| **What** | No graceful shutdown path |
-| **Why** | Deploys drop in-flight work |
-| **Looks for** | ListenAndServe without Shutdown |
-| **Stays quiet when** | Own Server; Shutdown on signal/ctx |
-| **Remediation** | Implement graceful shutdown |
-
-### `go-http.request-no-context`
-
-| | |
-| --- | --- |
-| **What** | Request built without context |
-| **Why** | Cancel does not propagate |
-| **Looks for** | `http.NewRequest` without context |
-| **Stays quiet when** | `NewRequestWithContext` |
-| **Remediation** | Always attach owning context |
-
-### `go-http.default-client`
-
-| | |
-| --- | --- |
-| **What** | Package-level DefaultClient helpers |
-| **Why** | No Timeout; shared process-wide |
-| **Looks for** | `http.Get`/`Post`/`Head`/`PostForm` |
-| **Stays quiet when** | Owned client with Timeout |
-| **Remediation** | Prefer explicit clients |
-
-### `go-http.response-writer-capabilities`
-
-| | |
-| --- | --- |
-| **What** | A transparent `http.ResponseWriter` wrapper claims to preserve `Flusher` or `Hijacker`, but relies only on `Unwrap`/`ResponseController` and does not declare the corresponding methods |
-| **Why** | Existing middleware often uses direct `w.(http.Flusher)` and `w.(http.Hijacker)` assertions, which do not follow `Unwrap` |
-| **Looks for** | A changed, explicit capability-preservation claim beside a writer wrapper, named optional interfaces, and missing `Flush`/`Hijack` methods |
-| **Stays quiet when** | Direct methods are declared; the wrapper intentionally reduces capabilities and makes no preservation claim; an ordinary recorder has no transparent-compatibility contract |
-| **Remediation** | Implement the claimed methods with wrapper-appropriate semantics and test both direct assertions and `http.ResponseController` |
+| Rule | Severity | Scans for |
+| --- | --- | --- |
+| `go-http.cancelled-response-publication` | Medium | A background producer publishes a `*http.Response` before signalling completion, while a response-body owner can return from a competing cancellation case without observing the ready response |
+| `go-http.client-no-timeout` | High | HTTP client has no timeout budget |
+| `go-http.client-response-body-close` | Medium | A consumed HTTP response body is not closed |
+| `go-http.client-response-limit` | Medium | Client buffers response without size limit |
+| `go-http.cors-permissive` | High | CORS allows overly broad origins/methods |
+| `go-http.default-client` | Medium | Package-level DefaultClient helpers |
+| `go-http.graceful-shutdown` | Medium | No graceful shutdown path |
+| `go-http.handler-body-limit` | High | Handler buffers request body without limit |
+| `go-http.provider-response-buffer-limit` | Medium | A production `http.ResponseWriter` substitute accumulates body data written by a provider, plugin, or downstream callback without a proven bound |
+| `go-http.redirect-open` | High | Open redirect on untrusted next URL |
+| `go-http.request-no-context` | Medium | Request built without context |
+| `go-http.response-writer-capabilities` | Medium | A transparent `http.ResponseWriter` wrapper claims to preserve `Flusher` or `Hijacker`, but relies only on `Unwrap`/`ResponseController` and does not declare the corresponding methods |
+| `go-http.server-timeouts` | High | HTTP server missing header-read timeout |
+| `go-http.websocket-origin` | High | WebSocket CheckOrigin always allows |
