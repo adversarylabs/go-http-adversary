@@ -1527,6 +1527,66 @@ test("tracks receiver mutation through bounded synchronous wrappers and sync.Onc
   assert.equal(signal.line, line);
 });
 
+test("tracks late-bound and parameter-forwarded synchronous mutation callbacks", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const mutation = "func() { select { case d = <-calls: default: } }";
+  const executed = [
+    `var mutate func(); first := func() { mutate() }; second := func() { first() }; mutate = ${mutation}; second()`,
+    `var mutate func(); wrapper := func() { mutate() }; mutate = ${mutation}; wrapper()`,
+    `mutate := ${mutation}; invoke := func(callback func()) { callback() }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { if enabled() { callback() } }; invoke(mutate)`,
+  ];
+  for (const [index, statements] of executed.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.equal(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      false,
+      `forwarded callback ${index}`,
+    );
+  }
+
+  const controls = [
+    `mutate := ${mutation}; invoke := func(callback func()) { _ = callback }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { go callback() }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { defer callback() }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { callback = func() {}; callback() }; invoke(mutate)`,
+  ];
+  for (const [index, statements] of controls.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      `non-executing callback ${index}`,
+    );
+  }
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; invoke := func(callback func()) { callback() }; invoke(mutate)\n  _ = d.BlockUntilResponseReady()`,
+  );
+  const current = previous.replace("invoke(mutate)", "_ = invoke");
+  const line = lineOf(current, "_ = invoke");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
 test("harmless work around a waiter error guard does not make late cancellation safe", async () => {
   const variants = [
     "waitErr := d.BlockUntilResponseReady()\n  observe()\n  if waitErr != nil { return waitErr }",

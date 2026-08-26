@@ -22439,7 +22439,7 @@ function definiteClosureInvocation(literal, relationship, owner, use, source) {
   const binding = closureLiteralBinding(literal, source);
   if (binding === void 0 || !containsNode(binding.scope, use)) return null;
   for (const call of descendants(owner, "call_expression")) {
-    if (call.startIndex <= binding.node.endIndex || call.endIndex >= use.startIndex || !containsNode(binding.scope, call)) continue;
+    if (call.endIndex >= use.startIndex || !containsNode(binding.scope, call)) continue;
     const path = callPath(call, source);
     if (path?.length !== 1 || !closureNameMayReferenceLiteral(
       owner,
@@ -22449,8 +22449,10 @@ function definiteClosureInvocation(literal, relationship, owner, use, source) {
       source
     )) continue;
     const execution = synchronousCallExecution(owner, call, use, path[0], source);
-    if (execution !== null) return execution;
+    if (execution !== null && closureBindingExecutesBefore(owner, binding, execution, source)) return execution;
   }
+  const callbackExecution = synchronousCallbackExecution(binding, owner, use, source);
+  if (callbackExecution !== null) return callbackExecution;
   for (const call of descendants(owner, "call_expression")) {
     if (call.startIndex <= binding.node.endIndex || call.endIndex >= use.startIndex || !pathEquals(callPath(call, source)?.slice(-1), ["Do"]) || !synchronousInvocation(call)) continue;
     const callback = unwrapExpression(callArguments(call)[0]);
@@ -22458,9 +22460,69 @@ function definiteClosureInvocation(literal, relationship, owner, use, source) {
     const callbackName = sourceText(callback, source).trim();
     if (!closureNameMayReferenceLiteral(owner, binding, callbackName, call, source) || !standardOnceReceiver(call, owner, source)) continue;
     const execution = synchronousCallExecution(owner, call, use, callbackName, source);
-    if (execution !== null) return execution;
+    if (execution !== null && closureBindingExecutesBefore(owner, binding, execution, source)) return execution;
   }
   return null;
+}
+function closureBindingExecutesBefore(owner, binding, execution, source) {
+  return executesBeforeUse(owner, binding.node, execution, source);
+}
+function synchronousCallbackExecution(origin, owner, use, source) {
+  for (const wrapper of descendants(owner, "func_literal")) {
+    if (!sameSyntaxNode(owningFunction(wrapper), owner)) continue;
+    const wrapperBinding = closureLiteralBinding(wrapper, source);
+    const parameterNames = directParameterNames(wrapper, source);
+    if (wrapperBinding === void 0 || parameterNames.length === 0) continue;
+    for (const call of descendants(owner, "call_expression")) {
+      if (call.endIndex >= use.startIndex || containsNode(wrapper, call)) continue;
+      const path = callPath(call, source);
+      if (path?.length !== 1 || !closureNameMayReferenceLiteral(
+        owner,
+        wrapperBinding,
+        path[0],
+        call,
+        source
+      )) continue;
+      const execution = synchronousCallExecution(owner, call, use, path[0], source);
+      if (execution === null || !closureBindingExecutesBefore(owner, wrapperBinding, execution, source) || !closureBindingExecutesBefore(owner, origin, execution, source)) continue;
+      const arguments_2 = callArguments(call);
+      for (let position = 0; position < Math.min(arguments_2.length, parameterNames.length); position += 1) {
+        const argument = unwrapExpression(arguments_2[position]);
+        const parameter = parameterNames[position];
+        if (argument?.type !== "identifier" || parameter === void 0 || !closureNameMayReferenceLiteral(
+          owner,
+          origin,
+          sourceText(argument, source).trim(),
+          call,
+          source
+        ) || !functionParameterInvoked(wrapper, parameter, source)) continue;
+        return execution;
+      }
+    }
+  }
+  return null;
+}
+function functionParameterInvoked(literal, parameter, source) {
+  const body2 = literal.childForFieldName("body");
+  if (body2 === null) return false;
+  return descendants(body2, "call_expression").some(
+    (call) => sameSyntaxNode(owningFunction(call), literal) && pathEquals(callPath(call, source), [parameter]) && synchronousInvocation(call) && directlyReachableInBlock(body2, call, source) && bindingPathPreserved(literal, parameter, call, source, body2.startIndex)
+  );
+}
+function directParameterNames(literal, source) {
+  const parameters = directParameterList(literal);
+  if (parameters === void 0) return [];
+  const names = [];
+  for (const parameter of parameters.namedChildren.filter(
+    (child) => child.type === "parameter_declaration" || child.type === "variadic_parameter_declaration"
+  )) {
+    const type = parameter.childForFieldName("type");
+    if (type === null) continue;
+    const prefix = source.slice(parameter.startIndex, type.startIndex).trim().replace(/^\.\.\./, "");
+    if (prefix === "") names.push(void 0);
+    else names.push(...prefix.split(",").map((name2) => name2.trim()));
+  }
+  return names;
 }
 function closureLiteralBinding(literal, source) {
   let binding = literal.parent;
@@ -22704,6 +22766,29 @@ function responseOwnerActivationStatements(owner, source) {
       })) continue;
       const binding = closureLiteralBinding(literal, source);
       if (binding !== void 0 && !closureNames.has(binding.name)) {
+        closureNames.add(binding.name);
+        expanded = true;
+      }
+    }
+    for (const literal of descendants(owner.method, "func_literal")) {
+      if (literal.endIndex >= owner.waitCall.startIndex) continue;
+      const binding = closureLiteralBinding(literal, source);
+      const parameters = directParameterNames(literal, source);
+      if (binding === void 0 || parameters.length === 0 || closureNames.has(binding.name)) continue;
+      const invokedWithTrackedCallback = descendants(owner.method, "call_expression").some((call) => {
+        if (call.endIndex >= owner.waitCall.startIndex || containsNode(literal, call) || !pathEquals(callPath(call, source), [binding.name])) return false;
+        return callArguments(call).some((argument, position) => {
+          const value = unwrapExpression(argument);
+          const parameter = parameters[position];
+          return value?.type === "identifier" && parameter !== void 0 && closureNames.has(sourceText(value, source).trim()) && functionParameterInvoked(literal, parameter, source);
+        });
+      });
+      if (invokedWithTrackedCallback) {
+        closureNames.add(binding.name);
+        expanded = true;
+      } else if (closureNames.size > 0 && parameters.some(
+        (parameter) => parameter !== void 0 && functionParameterInvoked(literal, parameter, source)
+      )) {
         closureNames.add(binding.name);
         expanded = true;
       }
