@@ -323,6 +323,109 @@ test("requires executable producer calls and accepts bounded cancellation synchr
   assert.ok((await repository(conditionalOwner)).signals.some((item) => item.ruleId === ruleId));
 });
 
+test("binds synchronization and ownership to all-path receiver and import provenance", async () => {
+  const parenthesizedIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    (func() { <-d.responseReady })()\n    return d.ctx.Err()",
+  );
+  const iifeHelper = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    func() { d.awaitLate() }()\n    return d.ctx.Err()",
+    );
+  for (const source of [parenthesizedIIFE, iifeHelper]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const conditionalReturn = iifeHelper
+    .replace("func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }", "func (d *duplexHTTPCall) awaitLate() { if skip() { return }; <-d.responseReady }")
+    .replace("func() { d.awaitLate() }()", "d.awaitLate()");
+  const bypassingGoto = conditionalReturn.replace(
+    "if skip() { return }; <-d.responseReady",
+    "goto done; <-d.responseReady; done:",
+  );
+  const reassignedHelper = conditionalReturn.replace(
+    "if skip() { return }; <-d.responseReady",
+    "d = otherCall; <-d.responseReady",
+  ).replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {");
+  const reassignedStart = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace("func (d *duplexHTTPCall) start() { go d.makeRequest() }", "func (d *duplexHTTPCall) start() { d = otherCall; go d.makeRequest() }");
+  const conditionalReassignedStart = reassignedStart.replace("d = otherCall;", "if replace() { d = otherCall };");
+  const rangedStart = reassignedStart.replace(
+    "d = otherCall; go d.makeRequest()",
+    "for _, d := range []*duplexHTTPCall{otherCall} { go d.makeRequest() }",
+  );
+  for (const source of [conditionalReturn, bypassingGoto, reassignedHelper]) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+  for (const source of [reassignedStart, conditionalReassignedStart, rangedStart]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+  const siblingShadowStart = reassignedStart.replace(
+    "d = otherCall; go d.makeRequest()",
+    "{ d := otherCall; _ = d }; go d.makeRequest()",
+  );
+  assert.ok((await repository(siblingShadowStart)).signals.some((item) => item.ruleId === ruleId));
+
+  const competingCallerSelect = vulnerable.replace(
+    "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+    "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: case <-otherReady(): }\n  if d.response == nil",
+  );
+  assert.ok((await repository(competingCallerSelect)).signals.some((item) => item.ruleId === ruleId));
+
+  const shadowedOwner = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      "if closeNow() { d := otherCall; return d.response.Body.Close() }\n  return nil",
+    );
+  const reassignedOwner = shadowedOwner.replace("d := otherCall", "d = otherCall");
+  const rangedOwner = shadowedOwner.replace(
+    "if closeNow() { d := otherCall; return d.response.Body.Close() }",
+    "for _, d := range []*duplexHTTPCall{otherCall} { return d.response.Body.Close() }",
+  );
+  for (const source of [shadowedOwner, reassignedOwner, rangedOwner]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const shadowedIO = vulnerable
+    .replace('  "net/http"', '  "net/http"\n  "io"')
+    .replace("type duplexHTTPCall struct {", "type fakeIO struct{}\nfunc (fakeIO) ReadAll(any) ([]byte, error) { return nil, nil }\nvar _ io.Reader\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      "io := fakeIO{}\n  _, err := io.ReadAll(d.response.Body)\n  return err",
+    );
+  assert.equal((await repository(shadowedIO)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("a changed nested owner guard is eligible semantic evidence", async () => {
+  const previous = vulnerable.replace(
+    "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "if false { return d.response.Body.Close() }\n  return nil",
+  );
+  const current = previous.replace("if false {", "if shouldClose() {");
+  const guardLine = lineOf(current, "if shouldClose()");
+  const result = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([guardLine]),
+    }],
+  });
+  const signal = result.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal, JSON.stringify(result.signals, null, 2));
+  assert.equal(signal.line, guardLine);
+});
+
 test("strings cannot fake producer cleanup or a response owner", async () => {
   const fakeCleanup = vulnerable.replace("d.response = response", 'd.response = response\n  log.Print("d.response.Body.Close()")');
   const fakeOwner = vulnerable.replace("if d.response == nil { return nil }\n  return d.response.Body.Close()", 'log.Print("d.response.Body.Close()")\n  return nil');
