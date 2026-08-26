@@ -1294,6 +1294,36 @@ test("select receiver invalidation is reachable, lexical, and deletion-aware", a
     assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
   }
 
+  const invokedCapture = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  func() { select { case d = <-calls: } }()\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(invokedCapture)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const twoValueReceive = ("var ok bool\n" + prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d, ok = <-calls: _ = ok; default: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(twoValueReceive)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const invokedShadows = [
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  func(d *duplexHTTPCall) { select { case d = <-calls: } }(d)\n  _ = d.BlockUntilResponseReady()",
+    ),
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  func() { d := <-calls; select { case d = <-calls: } }()\n  _ = d.BlockUntilResponseReady()",
+    ),
+    ("var other *duplexHTTPCall\n" + prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  { d := other; select { case d = <-calls: default: }; _ = d }\n  _ = d.BlockUntilResponseReady()",
+    ),
+  ];
+  for (const [index, source] of invokedShadows.entries()) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId), `variant ${index}`);
+  }
+
   const previous = (prefix + vulnerable).replace(
     "  _ = d.BlockUntilResponseReady()",
     "  select { case d = <-calls: _ = d; default: }\n  _ = d.BlockUntilResponseReady()",

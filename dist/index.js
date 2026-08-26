@@ -22402,15 +22402,21 @@ function rangeAssignmentChangesBinding(owner, name2, use, source, afterIndex) {
   });
 }
 function communicationAssignmentChangesBinding(owner, name2, use, source, afterIndex) {
-  const escaped = escapeRegExp(name2);
   const body2 = owner.childForFieldName("body");
   if (body2 === null) return false;
   return descendants(owner, "communication_case").some((clause) => {
     if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex) return false;
-    if (!sameSyntaxNode(owningFunction(clause), owner)) return false;
-    const statements = clause.namedChildren.find((child) => child.type === "statement_list");
-    const header = source.slice(clause.startIndex, statements?.startIndex ?? clause.endIndex);
-    if (!new RegExp(`(?:^|[,;\\s])${escaped}\\s*=(?!=)`).test(header)) return false;
+    let lexicalOwner = owningFunction(clause);
+    while (lexicalOwner !== null && !sameSyntaxNode(lexicalOwner, owner)) {
+      if (lexicalOwner.type !== "func_literal" || !localNameUnshadowedAtUse(lexicalOwner, name2, clause, source)) return false;
+      lexicalOwner = owningFunction(lexicalOwner);
+    }
+    if (lexicalOwner === null) return false;
+    if (ownerLocalDeclarationShadows(owner, name2, clause, source)) return false;
+    const receive = clause.namedChildren.find((child) => child.type === "receive_statement");
+    const left = receive?.childForFieldName("left");
+    const right = receive?.childForFieldName("right");
+    if (left === void 0 || left === null || right === void 0 || right === null || source.slice(left.endIndex, right.startIndex).trim() !== "=" || !directlyAssignsIdentifier(left, name2, source)) return false;
     const selection = nearestAncestorOfTypes(clause, /* @__PURE__ */ new Set(["select_statement"]));
     if (selection === null) return false;
     if (containsNode(clause, use)) {
@@ -22419,6 +22425,17 @@ function communicationAssignmentChangesBinding(owner, name2, use, source, afterI
     if (selection.endIndex >= use.startIndex || !executesBeforeUse(owner, selection, use, source)) return false;
     return true;
   });
+}
+function ownerLocalDeclarationShadows(owner, name2, use, source) {
+  return [
+    ...descendants(owner, "short_var_declaration"),
+    ...descendants(owner, "var_spec"),
+    ...descendants(owner, "const_spec")
+  ].some((declaration) => {
+    if (declaration.endIndex >= use.startIndex || !sameSyntaxNode(owningFunction(declaration), owner) || !declarationNames(declaration, source).has(name2)) return false;
+    const scope = enclosingBlock(declaration);
+    return scope !== null && containsNode(scope, use);
+  }) || lexicalControlBindingShadows(owner, name2, use, source);
 }
 function directlyAssignsIdentifier(node, name2, source) {
   const candidate = unwrapExpression(node);

@@ -1229,15 +1229,24 @@ function communicationAssignmentChangesBinding(
   source: string,
   afterIndex: number,
 ): boolean {
-  const escaped = escapeRegExp(name);
   const body = owner.childForFieldName("body");
   if (body === null) return false;
   return descendants(owner, "communication_case").some((clause) => {
     if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex) return false;
-    if (!sameSyntaxNode(owningFunction(clause), owner)) return false;
-    const statements = clause.namedChildren.find((child) => child.type === "statement_list");
-    const header = source.slice(clause.startIndex, statements?.startIndex ?? clause.endIndex);
-    if (!new RegExp(`(?:^|[,;\\s])${escaped}\\s*=(?!=)`).test(header)) return false;
+    let lexicalOwner = owningFunction(clause);
+    while (lexicalOwner !== null && !sameSyntaxNode(lexicalOwner, owner)) {
+      if (lexicalOwner.type !== "func_literal" ||
+        !localNameUnshadowedAtUse(lexicalOwner, name, clause, source)) return false;
+      lexicalOwner = owningFunction(lexicalOwner);
+    }
+    if (lexicalOwner === null) return false;
+    if (ownerLocalDeclarationShadows(owner, name, clause, source)) return false;
+    const receive = clause.namedChildren.find((child) => child.type === "receive_statement");
+    const left = receive?.childForFieldName("left");
+    const right = receive?.childForFieldName("right");
+    if (left === undefined || left === null || right === undefined || right === null ||
+      source.slice(left.endIndex, right.startIndex).trim() !== "=" ||
+      !directlyAssignsIdentifier(left, name, source)) return false;
     const selection = nearestAncestorOfTypes(clause, new Set(["select_statement"]));
     if (selection === null) return false;
     if (containsNode(clause, use)) {
@@ -1249,6 +1258,19 @@ function communicationAssignmentChangesBinding(
     // receiver, even when another arm or a default could preserve it.
     return true;
   });
+}
+
+function ownerLocalDeclarationShadows(owner: Node, name: string, use: Node, source: string): boolean {
+  return [
+    ...descendants(owner, "short_var_declaration"),
+    ...descendants(owner, "var_spec"),
+    ...descendants(owner, "const_spec"),
+  ].some((declaration) => {
+    if (declaration.endIndex >= use.startIndex || !sameSyntaxNode(owningFunction(declaration), owner) ||
+      !declarationNames(declaration, source).has(name)) return false;
+    const scope = enclosingBlock(declaration);
+    return scope !== null && containsNode(scope, use);
+  }) || lexicalControlBindingShadows(owner, name, use, source);
 }
 
 function directlyAssignsIdentifier(node: Node, name: string, source: string): boolean {
