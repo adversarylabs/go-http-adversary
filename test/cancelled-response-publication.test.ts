@@ -853,6 +853,57 @@ test("recognizes caller-side bounded re-observation and producer activation loca
   assert.equal(signal.line, changedLine);
 });
 
+test("treats only exhaustive terminating control flow as making later ownership unreachable", async () => {
+  const unreachable = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if enabled() { return } else { return }; go d.makeRequest() }",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: return nil; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: return nil; default: return nil }\n  if d.response == nil",
+    ),
+  ];
+  for (const source of unreachable) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+
+  const reachable = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if enabled() { return }; go d.makeRequest() }",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: return nil; default: _ = mode() }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: return nil; default: _ = mode() }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: if skip() { break }; return nil; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: if skip() { break }; return nil; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { panic := func(any) {}; if enabled() { panic(1) } else { panic(2) }; go d.makeRequest() }",
+    ),
+  ];
+  for (const source of reachable) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
 test("a reset after direct completion signalling does not erase the publication race", async () => {
   const source = vulnerable
     .replace("defer close(d.responseReady)\n", "")

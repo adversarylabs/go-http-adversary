@@ -22256,16 +22256,88 @@ function unconditionallyTerminatesBefore(block, candidate, target, source) {
     const label = candidate.namedChildren.find((child) => child.type === "label_name");
     if (label === void 0) return true;
     const name2 = sourceText(label, source);
-    const destination = topLevelStatements(block).find((statement) => {
+    const destination = [
+      ...topLevelStatements(block),
+      ...descendants(block, "labeled_statement")
+    ].find((statement) => {
       const destinationLabel = statement.childForFieldName("label");
       return statement.type === "labeled_statement" && destinationLabel !== null && sourceText(destinationLabel, source) === name2;
     });
     if (destination === void 0) return true;
     return destination.startIndex < candidate.startIndex || destination.startIndex > target.startIndex;
   }
+  if (candidate.type === "if_statement") {
+    const condition = booleanLiteral(candidate.childForFieldName("condition"), source);
+    const consequence = candidate.childForFieldName("consequence");
+    const alternative = candidate.childForFieldName("alternative");
+    const consequenceTerminates = consequence !== null && branchUnconditionallyTerminates(block, consequence, target, source);
+    const alternativeTerminates = alternative !== null && branchUnconditionallyTerminates(block, alternative, target, source);
+    if (condition === true) return consequenceTerminates;
+    if (condition === false) return alternativeTerminates;
+    return consequenceTerminates && alternativeTerminates;
+  }
+  if (candidate.type === "expression_switch_statement" || candidate.type === "type_switch_statement") {
+    const caseType = candidate.type === "expression_switch_statement" ? "expression_case" : "type_case";
+    const cases = [
+      ...descendants(candidate, caseType),
+      ...descendants(candidate, "default_case")
+    ].filter(
+      (caseNode) => nearestAncestorOfTypes(caseNode, /* @__PURE__ */ new Set(["expression_switch_statement", "type_switch_statement"]))?.id === candidate.id
+    );
+    return cases.length > 0 && cases.some((caseNode) => isDefaultCase(caseNode, source)) && cases.every((caseNode) => caseUnconditionallyTerminates(block, caseNode, target, source));
+  }
+  if (candidate.type === "select_statement") {
+    const cases = [
+      ...descendants(candidate, "communication_case"),
+      ...descendants(candidate, "default_case")
+    ].filter(
+      (caseNode) => nearestAncestorOfTypes(caseNode, /* @__PURE__ */ new Set(["select_statement"]))?.id === candidate.id
+    );
+    return cases.length > 0 && cases.some((caseNode) => isDefaultCase(caseNode, source)) && cases.every((caseNode) => caseUnconditionallyTerminates(block, caseNode, target, source));
+  }
   if (candidate.type !== "expression_statement") return false;
   const expression = unwrapExpression(candidate.namedChildren[0]);
   return expression?.type === "call_expression" && pathEquals(callPath(expression, source), ["panic"]) && unshadowedBuiltin(expression, "panic", source);
+}
+function branchUnconditionallyTerminates(block, branch, target, source) {
+  if (branch.type === "else_clause") {
+    const nested = branch.namedChildren.find((child) => child.type === "block" || child.type === "if_statement");
+    return nested !== void 0 && branchUnconditionallyTerminates(block, nested, target, source);
+  }
+  if (branch.type === "block") {
+    return statementSequenceUnconditionallyTerminates(block, topLevelStatements(branch), target, source);
+  }
+  return unconditionallyTerminatesBefore(block, branch, target, source);
+}
+function caseUnconditionallyTerminates(block, caseNode, target, source) {
+  const statements = caseNode.namedChildren.find((child) => child.type === "statement_list");
+  return statements !== void 0 && statementSequenceUnconditionallyTerminates(block, statements.namedChildren, target, source);
+}
+function statementSequenceUnconditionallyTerminates(block, statements, target, source) {
+  const owner = owningFunction(target);
+  for (const statement of statements) {
+    if (unconditionallyTerminatesBefore(block, statement, target, source)) return true;
+    if (owner !== null && statementCanBypassRemainder(statement, owner)) return false;
+  }
+  return false;
+}
+function statementCanBypassRemainder(statement, owner) {
+  return [
+    ...descendants(statement, "break_statement"),
+    ...descendants(statement, "continue_statement"),
+    ...descendants(statement, "goto_statement")
+  ].some((candidate) => sameSyntaxNode(owningFunction(candidate), owner));
+}
+function isDefaultCase(caseNode, source) {
+  return caseNode.type === "default_case" || /^default\s*:/.test(sourceText(caseNode, source).trimStart());
+}
+function nearestAncestorOfTypes(node, types) {
+  let current = node.parent;
+  while (current !== null) {
+    if (types.has(current.type)) return current;
+    current = current.parent;
+  }
+  return null;
 }
 function unshadowedBuiltin(use, name2, source) {
   let root = use;
