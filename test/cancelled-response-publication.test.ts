@@ -205,9 +205,13 @@ test("requires reachable producer signalling and body ownership", async () => {
     vulnerable.replace("defer close(d.responseReady)", "if false { defer close(d.responseReady) }"),
     vulnerable.replace("_ = d.BlockUntilResponseReady()", "_ = d.BlockUntilResponseReady()\n  return nil"),
   ];
-  for (const source of variants) {
+  for (const [index, source] of variants.entries()) {
     const result = await repository(source);
-    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+    assert.equal(
+      result.signals.some((item) => item.ruleId === ruleId),
+      false,
+      `variant ${index}: ${JSON.stringify(result.signals, null, 2)}`,
+    );
   }
 });
 
@@ -251,6 +255,179 @@ test("recognizes reachable nested producer starts without reviving statically de
     const result = await repository(source);
     assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
   }
+});
+
+test("requires executable producer calls and accepts bounded cancellation synchronization", async () => {
+  const inertNestedClosure = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { go func() { _ = func() { d.makeRequest() } }() }",
+  );
+  assert.equal((await repository(inertNestedClosure)).signals.some((item) => item.ruleId === ruleId), false);
+  const deadInvokedProducer = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { go func() { if false { d.makeRequest() } }() }",
+  );
+  assert.equal((await repository(deadInvokedProducer)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const invokedProducerClosures = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { go func() { d.makeRequest() }() }",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { go func() { func() { d.makeRequest() }() }() }",
+    ),
+  ];
+  for (const source of invokedProducerClosures) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const cancellationIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { <-d.responseReady }()\n    return d.ctx.Err()",
+  );
+  const cancellationHelper = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    d.awaitLate()\n    return d.ctx.Err()",
+    );
+  for (const source of [cancellationIIFE, cancellationHelper]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const conditionalHelper = cancellationHelper.replace(
+    "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }",
+    "func (d *duplexHTTPCall) awaitLate() { if shouldWait() { <-d.responseReady } }",
+  );
+  const competingIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { select { case <-d.responseReady: case <-otherReady(): } }()\n    return d.ctx.Err()",
+  );
+  const asyncIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { go func() { <-d.responseReady }() }()\n    return d.ctx.Err()",
+  );
+  const deferredIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { defer func() { <-d.responseReady }() }()\n    return d.ctx.Err()",
+  );
+  for (const [index, source] of [conditionalHelper, competingIIFE, asyncIIFE, deferredIIFE].entries()) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId), `unsafe synchronization ${index}`);
+  }
+
+  const conditionalOwner = vulnerable.replace(
+    "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "if d.response != nil && shouldClose() { return d.response.Body.Close() }\n  return nil",
+  );
+  assert.ok((await repository(conditionalOwner)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("binds synchronization and ownership to all-path receiver and import provenance", async () => {
+  const parenthesizedIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    (func() { <-d.responseReady })()\n    return d.ctx.Err()",
+  );
+  const iifeHelper = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    func() { d.awaitLate() }()\n    return d.ctx.Err()",
+    );
+  for (const source of [parenthesizedIIFE, iifeHelper]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const conditionalReturn = iifeHelper
+    .replace("func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }", "func (d *duplexHTTPCall) awaitLate() { if skip() { return }; <-d.responseReady }")
+    .replace("func() { d.awaitLate() }()", "d.awaitLate()");
+  const bypassingGoto = conditionalReturn.replace(
+    "if skip() { return }; <-d.responseReady",
+    "goto done; <-d.responseReady; done:",
+  );
+  const reassignedHelper = conditionalReturn.replace(
+    "if skip() { return }; <-d.responseReady",
+    "d = otherCall; <-d.responseReady",
+  ).replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {");
+  const reassignedStart = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace("func (d *duplexHTTPCall) start() { go d.makeRequest() }", "func (d *duplexHTTPCall) start() { d = otherCall; go d.makeRequest() }");
+  const conditionalReassignedStart = reassignedStart.replace("d = otherCall;", "if replace() { d = otherCall };");
+  const rangedStart = reassignedStart.replace(
+    "d = otherCall; go d.makeRequest()",
+    "for _, d := range []*duplexHTTPCall{otherCall} { go d.makeRequest() }",
+  );
+  for (const source of [conditionalReturn, bypassingGoto, reassignedHelper]) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+  for (const source of [reassignedStart, conditionalReassignedStart, rangedStart]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+  const siblingShadowStart = reassignedStart.replace(
+    "d = otherCall; go d.makeRequest()",
+    "{ d := otherCall; _ = d }; go d.makeRequest()",
+  );
+  assert.ok((await repository(siblingShadowStart)).signals.some((item) => item.ruleId === ruleId));
+
+  const competingCallerSelect = vulnerable.replace(
+    "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+    "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: case <-otherReady(): }\n  if d.response == nil",
+  );
+  assert.ok((await repository(competingCallerSelect)).signals.some((item) => item.ruleId === ruleId));
+
+  const shadowedOwner = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      "if closeNow() { d := otherCall; return d.response.Body.Close() }\n  return nil",
+    );
+  const reassignedOwner = shadowedOwner.replace("d := otherCall", "d = otherCall");
+  const rangedOwner = shadowedOwner.replace(
+    "if closeNow() { d := otherCall; return d.response.Body.Close() }",
+    "for _, d := range []*duplexHTTPCall{otherCall} { return d.response.Body.Close() }",
+  );
+  for (const source of [shadowedOwner, reassignedOwner, rangedOwner]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const shadowedIO = vulnerable
+    .replace('  "net/http"', '  "net/http"\n  "io"')
+    .replace("type duplexHTTPCall struct {", "type fakeIO struct{}\nfunc (fakeIO) ReadAll(any) ([]byte, error) { return nil, nil }\nvar _ io.Reader\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      "io := fakeIO{}\n  _, err := io.ReadAll(d.response.Body)\n  return err",
+    );
+  assert.equal((await repository(shadowedIO)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("a changed nested owner guard is eligible semantic evidence", async () => {
+  const previous = vulnerable.replace(
+    "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "if false { return d.response.Body.Close() }\n  return nil",
+  );
+  const current = previous.replace("if false {", "if shouldClose() {");
+  const guardLine = lineOf(current, "if shouldClose()");
+  const result = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([guardLine]),
+    }],
+  });
+  const signal = result.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal, JSON.stringify(result.signals, null, 2));
+  assert.equal(signal.line, guardLine);
 });
 
 test("strings cannot fake producer cleanup or a response owner", async () => {
@@ -582,6 +759,887 @@ test("accepts synchronous producer and cancellation cleanup through bounded dire
   for (const source of [asyncProducerCleanup, asyncCancellationHelper]) {
     assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
   }
+});
+
+test("tracks all-path waits and receiver identity through executed control flow", async () => {
+  const bypassingWaits = [
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    func() { if shouldSkip() { return }; <-d.responseReady }()\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      `case <-d.ctx.Done():
+    return d.ctx.Err()
+  }
+}`,
+      `case <-d.ctx.Done():
+    if shouldSkip() { goto done }
+    <-d.responseReady
+    return d.ctx.Err()
+  }
+done:
+  return d.ctx.Err()
+}`,
+    ),
+  ];
+  for (const source of bypassingWaits) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const receiverChanges = [
+    vulnerable
+      .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+      .replace(
+        "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+        "func (d *duplexHTTPCall) start() { func() { d = other }(); go d.makeRequest() }",
+      ),
+    vulnerable
+      .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+      .replace(
+        "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+        "func (d *duplexHTTPCall) start() { for _, d = range []*duplexHTTPCall{other} { go d.makeRequest() } }",
+      ),
+    vulnerable
+      .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+      .replace(
+        "_ = d.BlockUntilResponseReady()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+        "_ = d.BlockUntilResponseReady()\n  func() { d = other }()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      ),
+  ];
+  for (const source of receiverChanges) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+
+  const unreachableChange = vulnerable
+    .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if false { d = other }; go d.makeRequest() }",
+    );
+  assert.ok((await repository(unreachableChange)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("recognizes caller-side bounded re-observation and producer activation locality", async () => {
+  const boundedCaller = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      "_ = d.BlockUntilResponseReady()\n  d.awaitLate()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    );
+  assert.equal(
+    (await repository(boundedCaller)).signals.some((item) => item.ruleId === ruleId),
+    false,
+  );
+
+  const previous = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { if false { go d.makeRequest() } }",
+  );
+  const current = previous.replace("if false { go", "if shouldStart() { go");
+  const changedLine = lineOf(current, "if shouldStart()");
+  const result = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([changedLine]),
+    }],
+  });
+  const signal = result.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal, JSON.stringify(result.signals, null, 2));
+  assert.equal(signal.line, changedLine);
+});
+
+test("treats only exhaustive terminating control flow as making later ownership unreachable", async () => {
+  const unreachable = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if enabled() { return } else { return }; go d.makeRequest() }",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: return nil; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: return nil; default: return nil }\n  if d.response == nil",
+    ),
+  ];
+  for (const source of unreachable) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+
+  const reachable = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if enabled() { return }; go d.makeRequest() }",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: return nil; default: _ = mode() }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: return nil; default: _ = mode() }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: if skip() { break }; return nil; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: if skip() { break }; return nil; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { panic := func(any) {}; if enabled() { panic(1) } else { panic(2) }; go d.makeRequest() }",
+    ),
+  ];
+  for (const source of reachable) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
+test("selects only reachable cancellation returns and honors a dominating completion wait", async () => {
+  const variants = [
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    if false { return d.ctx.Err() }\n    <-d.responseReady\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    <-d.responseReady\n    if retry() { return d.ctx.Err() }\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    switch false { case true: return d.ctx.Err() }\n    <-d.responseReady\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    for false { return d.ctx.Err() }\n    <-d.responseReady\n    return d.ctx.Err()",
+    ),
+  ];
+  for (const [index, source] of variants.entries()) {
+    const result = await repository(source);
+    assert.equal(
+      result.signals.some((item) => item.ruleId === ruleId),
+      false,
+      `cancellation variant ${index}: ${JSON.stringify(result.signals, null, 2)}`,
+    );
+  }
+});
+
+test("requires producer cleanup before signalling and preserves wrapper receiver identity", async () => {
+  const cleanupAfterSignal = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace("  d.response = response", "  d.response = response\n  close(d.responseReady)\n  _ = d.response.Body.Close()");
+  const iifeCleanupAfterSignal = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  close(d.responseReady)\n  func() { _ = d.response.Body.Close() }()",
+    );
+  for (const source of [cleanupAfterSignal, iifeCleanupAfterSignal]) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const unsafeDeferOrder = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  defer d.response.Body.Close()\n  defer close(d.responseReady)",
+    );
+  assert.ok((await repository(unsafeDeferOrder)).signals.some((item) => item.ruleId === ruleId));
+
+  const safeDeferOrder = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  defer close(d.responseReady)\n  defer d.response.Body.Close()",
+    );
+  assert.equal((await repository(safeDeferOrder)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const reassignedWrapper = vulnerable
+    .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      `func (d *duplexHTTPCall) CloseRead() error {
+  _ = d.BlockUntilResponseReady()
+  if d.response == nil { return nil }
+  return d.response.Body.Close()
+}`,
+      `func (d *duplexHTTPCall) responseAfterWait() *http.Response {
+  _ = d.BlockUntilResponseReady()
+  d = other
+  return d.response
+}
+func (d *duplexHTTPCall) CloseRead() error {
+  response := d.responseAfterWait()
+  return response.Body.Close()
+}`,
+    );
+  assert.equal((await repository(reassignedWrapper)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("requires direct-IIFE producer cleanup on every path with the published binding", async () => {
+  const conditional = vulnerable.replace(
+    "  d.response = response",
+    "  d.response = response\n  func() { if shouldClose() { _ = d.response.Body.Close() } }()",
+  );
+  const earlyReturn = vulnerable.replace(
+    "  d.response = response",
+    "  d.response = response\n  func() { if skip() { return }; _ = d.response.Body.Close() }()",
+  );
+  const reassignedLocal = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherResponse *http.Response\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  response = otherResponse\n  _ = response.Body.Close()",
+    );
+  const reassignedReceiver = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  func() { d = otherCall; _ = d.response.Body.Close() }()",
+    );
+  for (const [index, source] of [conditional, earlyReturn, reassignedLocal, reassignedReceiver].entries()) {
+    const result = await repository(source);
+    assert.ok(result.signals.some((item) => item.ruleId === ruleId),
+      `unsafe producer cleanup ${index}: ${JSON.stringify(result.signals, null, 2)}`);
+  }
+
+  const exhaustive = vulnerable.replace(
+    "  d.response = response",
+    "  d.response = response\n  func() { if shouldClose() { _ = d.response.Body.Close() } else { _ = d.response.Body.Close() } }()",
+  );
+  assert.equal((await repository(exhaustive)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("recognizes only executed response owners after the waiter", async () => {
+  const invoked = vulnerable.replace(
+    "  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  return func() error { return d.response.Body.Close() }()",
+  );
+  assert.ok((await repository(invoked)).signals.some((item) => item.ruleId === ruleId));
+
+  const stored = vulnerable.replace(
+    "  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  cleanup := func() error { return d.response.Body.Close() }; _ = cleanup\n  return nil",
+  );
+  assert.equal((await repository(stored)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const deferred = vulnerable.replace(
+    "  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  defer d.response.Body.Close()\n  return nil",
+  );
+  assert.ok((await repository(deferred)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("requires cancellation IIFE synchronization on every execution path", async () => {
+  const allPaths = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { if retry() { <-d.responseReady; return }; <-d.responseReady }()\n    return d.ctx.Err()",
+  );
+  assert.equal((await repository(allPaths)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const conditional = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { if shouldWait() { <-d.responseReady } }()\n    return d.ctx.Err()",
+  );
+  assert.ok((await repository(conditional)).signals.some((item) => item.ruleId === ruleId));
+
+  const conditionalHelper = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    func() { if retry() { d.awaitLate() } }()\n    return d.ctx.Err()",
+    );
+  assert.ok((await repository(conditionalHelper)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("keeps inline and split waiter error guards equivalent for response cleanup", async () => {
+  const variants = [
+    vulnerable.replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  if err := d.BlockUntilResponseReady(); err != nil { return err }",
+    ),
+    vulnerable.replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  err := d.BlockUntilResponseReady()\n  if err != nil { return err }",
+    ),
+  ];
+  for (const source of variants) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
+test("accepts only exhaustive switch and select cancellation synchronization", async () => {
+  const exhaustiveSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch mode() {
+    case 1:
+      <-d.responseReady
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  const exhaustiveSelect = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    select {
+    case <-d.responseReady:
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  const exhaustiveBlockingSelect = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    select {
+    case <-d.responseReady:
+    case <-otherReady():
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  for (const source of [exhaustiveSwitch, exhaustiveSelect, exhaustiveBlockingSelect]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const conditionalSwitch = exhaustiveSwitch.replace("default:\n      <-d.responseReady", "default:");
+  assert.ok((await repository(conditionalSwitch)).signals.some((item) => item.ruleId === ruleId));
+
+  const partialBlockingSelect = exhaustiveBlockingSelect.replace(
+    "case <-otherReady():\n      <-d.responseReady",
+    "case <-otherReady():",
+  );
+  assert.ok((await repository(partialBlockingSelect)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("follows switch fallthrough and break transfers to a common completion wait", async () => {
+  const fallthroughSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch mode() {
+    case 1:
+      fallthrough
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  const breakingSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch mode() {
+    case 1:
+      break
+    default:
+      break
+    }
+    <-d.responseReady
+    return d.ctx.Err()`,
+  );
+  const breakingSelect = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    select {
+    case <-otherReady():
+      break
+    default:
+      break
+    }
+    <-d.responseReady
+    return d.ctx.Err()`,
+  );
+  const conditionalSwitchBreak = breakingSwitch.replace("      break\n    default:", "      if retry() { break }\n      observeOnly()\n    default:");
+  const conditionalSelectBreak = breakingSelect.replace("      break\n    default:", "      if retry() { break }\n      observeOnly()\n    default:");
+  const labeledSwitchBreak = breakingSwitch
+    .replace("    switch mode()", "  choose:\n    switch mode()")
+    .replaceAll("      break", "      break choose");
+  for (const source of [
+    fallthroughSwitch,
+    breakingSwitch,
+    breakingSelect,
+    conditionalSwitchBreak,
+    conditionalSelectBreak,
+    labeledSwitchBreak,
+  ]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const unsynchronizedFallthrough = fallthroughSwitch.replace("      <-d.responseReady", "      observeOnly()");
+  assert.ok((await repository(unsynchronizedFallthrough)).signals.some((item) => item.ruleId === ruleId));
+  const bypassingSwitch = breakingSwitch.replace("case 1:\n      break", "case 1:\n      return d.ctx.Err()");
+  assert.ok((await repository(bypassingSwitch)).signals.some((item) => item.ruleId === ruleId));
+  const bypassingSelect = breakingSelect.replace("case <-otherReady():\n      break", "case <-otherReady():\n      return d.ctx.Err()");
+  assert.ok((await repository(bypassingSelect)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("binds cancellation synchronization and waiter guards to the original values", async () => {
+  const receiverVariants = [
+    "d = other\n    <-d.responseReady",
+    "d := other\n    <-d.responseReady",
+  ];
+  for (const replacement of receiverVariants) {
+    const source = ("var other *duplexHTTPCall\n\n" + vulnerable).replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      `case <-d.ctx.Done():\n    ${replacement}\n    return d.ctx.Err()`,
+    );
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const selfAssignment = vulnerable.replace(
+    "  _ = d.BlockUntilResponseReady()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  err := d.BlockUntilResponseReady()\n  err = err\n  if err != nil { return err }\n  _, err = d.response.Body.Read(nil)\n  return err",
+  );
+  assert.equal((await repository(selfAssignment)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("tracks select rebinding and exhaustive type-switch synchronization", async () => {
+  const reboundOwner = ("var calls chan *duplexHTTPCall\n\n" + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(reboundOwner)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const conditionalReboundOwner = ("var calls chan *duplexHTTPCall\n\n" + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: default: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(conditionalReboundOwner)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const everyArmReboundOwner = ("var calls, calls2 chan *duplexHTTPCall\n\n" + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: case d = <-calls2: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(everyArmReboundOwner)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const exhaustiveTypeSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch any(mode()).(type) {
+    case int:
+      <-d.responseReady
+    case string:
+      <-d.responseReady
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  assert.equal((await repository(exhaustiveTypeSwitch)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const partialTypeSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch any(mode()).(type) {
+    case int:
+      observe()
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  assert.ok((await repository(partialTypeSwitch)).signals.some((item) => item.ruleId === ruleId));
+
+  const safeTypeSwitch = partialTypeSwitch.replace("    case int:\n      observe()", "    case int:\n      <-d.responseReady");
+  const changedLine = lineOf(partialTypeSwitch, "observe()");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current: partialTypeSwitch,
+      previous: safeTypeSwitch,
+      status: "modified",
+      changedLines: new Set([changedLine]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, changedLine);
+});
+
+test("select receiver invalidation is reachable, lexical, and deletion-aware", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const preserved = [
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  if false { select { case d = <-calls: } }\n  _ = d.BlockUntilResponseReady()",
+    ),
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  work := func() { select { case d = <-calls: } }; _ = work\n  _ = d.BlockUntilResponseReady()",
+    ),
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  work := func(d *duplexHTTPCall) { select { case d = <-calls: } }; _ = work\n  _ = d.BlockUntilResponseReady()",
+    ),
+  ];
+  for (const source of preserved) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const invokedCapture = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  func() { select { case d = <-calls: } }()\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(invokedCapture)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const invokedStoredCapture = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  mutate := func() { select { case d = <-calls: default: } }; mutate()\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(invokedStoredCapture)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const reboundStoredCapture = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  mutate := func() { select { case d = <-calls: default: } }; mutate = func() {}; mutate()\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.ok((await repository(reboundStoredCapture)).signals.some((item) => item.ruleId === ruleId));
+
+  const nonSynchronousCaptures = [
+    "mutate := func() { select { case d = <-calls: default: } }; go mutate()",
+    "mutate := func() { select { case d = <-calls: default: } }; defer mutate()",
+    "go func() { select { case d = <-calls: default: } }()",
+  ];
+  for (const replacement of nonSynchronousCaptures) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${replacement}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const twoValueReceive = ("var ok bool\n" + prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d, ok = <-calls: _ = ok; default: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(twoValueReceive)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const invokedShadows = [
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  func(d *duplexHTTPCall) { select { case d = <-calls: } }(d)\n  _ = d.BlockUntilResponseReady()",
+    ),
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  func() { d := <-calls; select { case d = <-calls: } }()\n  _ = d.BlockUntilResponseReady()",
+    ),
+    ("var other *duplexHTTPCall\n" + prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  { d := other; select { case d = <-calls: default: }; _ = d }\n  _ = d.BlockUntilResponseReady()",
+    ),
+  ];
+  for (const [index, source] of invokedShadows.entries()) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId), `variant ${index}`);
+  }
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: _ = d; default: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  const current = previous.replace("case d = <-calls", "case d := <-calls");
+  const line = lineOf(current, "case d :=");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
+test("tracks captured receiver mutation through executed closure value lineage", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const mutation = "func() { select { case d = <-calls: default: } }";
+  const variants = [
+    `mutate := ${mutation}; alias := mutate; alias()`,
+    `mutate := ${mutation}; mutate = mutate; mutate()`,
+    `mutate := ${mutation}; if false { mutate = func() {} }; mutate()`,
+    `mutate := ${mutation}; if enabled() { mutate = func() {} }; mutate()`,
+    `mutate := ${mutation}; mutate(); mutate = func() {}`,
+    `mutate := ${mutation}; cleanup := func() {}; cleanup = func() {}; mutate()`,
+    `mutate := ${mutation}; { mutate := func() {}; mutate() }; mutate()`,
+    `mutate := ${mutation}; if enabled() { mutate() }`,
+    `mutate := ${mutation}; func() { mutate() }()`,
+    `var mutate = ${mutation}; mutate()`,
+    "mutate := func(_ bool) { select { case d = <-calls: default: } }; mutate(true)",
+  ];
+  for (const [index, statements] of variants.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.equal(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      false,
+      `lineage variant ${index}`,
+    );
+  }
+
+  const aliasSurvivesReassignment = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; alias := mutate; mutate = func() {}; alias()\n  _ = d.BlockUntilResponseReady()`,
+  );
+  assert.equal(
+    (await repository(aliasSurvivesReassignment)).signals.some((item) => item.ruleId === ruleId),
+    false,
+  );
+
+  const nonInvocations = [
+    `mutate := ${mutation}; mutate = func() {}; mutate()`,
+    `mutate := ${mutation}; if enabled() { mutate = func() {}; mutate() }`,
+    `mutate := ${mutation}; { mutate := func() {}; mutate() }`,
+    `mutate := ${mutation}; go mutate()`,
+    `mutate := ${mutation}; defer mutate()`,
+    `mutate := ${mutation}; wrapper := func() { mutate() }; _ = wrapper`,
+  ];
+  for (const [index, statements] of nonInvocations.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      `non-invocation ${index}`,
+    );
+  }
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; mutate()\n  _ = d.BlockUntilResponseReady()`,
+  );
+  const current = previous.replace("mutate()", "_ = mutate");
+  const line = lineOf(current, "_ = mutate");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
+test("tracks receiver mutation through bounded synchronous wrappers and sync.Once callbacks", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const mutation = "func() { select { case d = <-calls: default: } }";
+  const executed = [
+    `mutate := ${mutation}; invoke := func() { mutate() }; invoke()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; alias := invoke; alias()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; first, second := invoke, func() {}; _ = second; first()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; (invoke)()`,
+    `mutate := ${mutation}; invoke := func() { if enabled() { mutate() } }; invoke()`,
+  ];
+  for (const [index, statements] of executed.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.equal(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      false,
+      `wrapper variant ${index}`,
+    );
+  }
+
+  const once = (prefix + vulnerable)
+    .replace('  "net/http"\n)', '  "net/http"\n  "sync"\n)\nvar once sync.Once')
+    .replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  mutate := ${mutation}; once.Do(mutate)\n  _ = d.BlockUntilResponseReady()`,
+    );
+  assert.equal((await repository(once)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const nonExecutions = [
+    `mutate := ${mutation}; invoke := func() { mutate() }; _ = invoke`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; if false { invoke() }`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; go invoke()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; defer invoke()`,
+    `mutate := ${mutation}; fake := struct{ Do func(func()) }{}; fake.Do(mutate)`,
+  ];
+  for (const [index, statements] of nonExecutions.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      `non-executing wrapper ${index}`,
+    );
+  }
+
+  const shadowedSync = (prefix + vulnerable)
+    .replace('  "net/http"\n)', '  "net/http"\n  "sync"\n)\nvar once sync.Once')
+    .replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  mutate := ${mutation}; sync := struct{ Once int }{}; _ = sync; once.Do(mutate)\n  _ = d.BlockUntilResponseReady()`,
+    );
+  assert.ok((await repository(shadowedSync)).signals.some((item) => item.ruleId === ruleId));
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; invoke := func() { mutate() }; alias := invoke; alias()\n  _ = d.BlockUntilResponseReady()`,
+  );
+  const current = previous.replace("alias()", "_ = alias");
+  const line = lineOf(current, "_ = alias");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
+test("tracks late-bound and parameter-forwarded synchronous mutation callbacks", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const mutation = "func() { select { case d = <-calls: default: } }";
+  const executed = [
+    `var mutate func(); first := func() { mutate() }; second := func() { first() }; mutate = ${mutation}; second()`,
+    `var mutate func(); wrapper := func() { mutate() }; mutate = ${mutation}; wrapper()`,
+    `mutate := ${mutation}; invoke := func(callback func()) { callback() }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { if enabled() { callback() } }; invoke(mutate)`,
+  ];
+  for (const [index, statements] of executed.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.equal(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      false,
+      `forwarded callback ${index}`,
+    );
+  }
+
+  const controls = [
+    `mutate := ${mutation}; invoke := func(callback func()) { _ = callback }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { go callback() }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { defer callback() }; invoke(mutate)`,
+    `mutate := ${mutation}; invoke := func(callback func()) { callback = func() {}; callback() }; invoke(mutate)`,
+  ];
+  for (const [index, statements] of controls.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      `non-executing callback ${index}`,
+    );
+  }
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; invoke := func(callback func()) { callback() }; invoke(mutate)\n  _ = d.BlockUntilResponseReady()`,
+  );
+  const current = previous.replace("invoke(mutate)", "_ = invoke");
+  const line = lineOf(current, "_ = invoke");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
+test("harmless work around a waiter error guard does not make late cancellation safe", async () => {
+  const variants = [
+    "waitErr := d.BlockUntilResponseReady()\n  observe()\n  if waitErr != nil { return waitErr }",
+    "waitErr := d.BlockUntilResponseReady()\n  { waitErr := otherErr(); _ = waitErr }\n  if waitErr != nil { return waitErr }",
+    "waitErr := d.BlockUntilResponseReady()\n  unrelated := 1\n  _ = unrelated\n  if waitErr != nil { return waitErr }",
+  ];
+  for (const replacement of variants) {
+    const source = vulnerable.replace("_ = d.BlockUntilResponseReady()", replacement);
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
+test("handles select, fallthrough, infinite-loop, and deletion-only relationship reachability", async () => {
+  const unreachableOwners = [
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: return nil; case <-d.ctx.Done(): return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: fallthrough; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  for {}\n  if d.response == nil",
+    ),
+  ];
+  for (const source of unreachableOwners) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const prefix = "var other *duplexHTTPCall\n\n";
+  const previous = (prefix + vulnerable).replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { d = other; go d.makeRequest() }",
+  );
+  const current = previous.replace("d = other; ", "");
+  const deletionOnly = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{ path: "duplex_http_call.go", current, previous, status: "modified", changedLines: new Set() }],
+  });
+  assert.ok(deletionOnly.signals.some((item) => item.ruleId === ruleId));
+
+  const line = lineOf(current, "func (d *duplexHTTPCall) start");
+  const adjacent = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{ path: "duplex_http_call.go", current, previous, status: "modified", changedLines: new Set([line]) }],
+  });
+  const signal = adjacent.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
 });
 
 test("a reset after direct completion signalling does not erase the publication race", async () => {

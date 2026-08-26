@@ -17,6 +17,12 @@ test("the published runtime executes without node_modules", async () => {
   const input = join(artifact, "input.json");
   const output = join(artifact, "output.json");
 
+  const ignored = (await readFile(join(projectRoot, ".adversaryignore"), "utf8"))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  assert.ok(ignored.includes(".git"));
+
   await mkdir(dirname(entrypoint), { recursive: true });
   await mkdir(join(artifact, "schemas"), { recursive: true });
   await copyFile(join(projectRoot, "dist", "index.js"), entrypoint);
@@ -87,7 +93,7 @@ func (c *call) closeResponse() error {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-http");
-  assert.equal(envelope.result.adversary.version, "0.0.18");
+  assert.equal(envelope.result.adversary.version, "0.0.20");
   assert.equal(
     envelope.result.findings.some((finding: { ruleId?: string }) =>
       finding.ruleId === "go-http.cancelled-response-publication"
