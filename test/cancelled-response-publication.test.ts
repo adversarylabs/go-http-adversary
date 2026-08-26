@@ -988,6 +988,85 @@ func (d *duplexHTTPCall) CloseRead() error {
   assert.equal((await repository(reassignedWrapper)).signals.some((item) => item.ruleId === ruleId), false);
 });
 
+test("requires direct-IIFE producer cleanup on every path with the published binding", async () => {
+  const conditional = vulnerable.replace(
+    "  d.response = response",
+    "  d.response = response\n  func() { if shouldClose() { _ = d.response.Body.Close() } }()",
+  );
+  const earlyReturn = vulnerable.replace(
+    "  d.response = response",
+    "  d.response = response\n  func() { if skip() { return }; _ = d.response.Body.Close() }()",
+  );
+  const reassignedLocal = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherResponse *http.Response\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  response = otherResponse\n  _ = response.Body.Close()",
+    );
+  const reassignedReceiver = vulnerable
+    .replace("type duplexHTTPCall struct {", "var otherCall *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  func() { d = otherCall; _ = d.response.Body.Close() }()",
+    );
+  for (const [index, source] of [conditional, earlyReturn, reassignedLocal, reassignedReceiver].entries()) {
+    const result = await repository(source);
+    assert.ok(result.signals.some((item) => item.ruleId === ruleId),
+      `unsafe producer cleanup ${index}: ${JSON.stringify(result.signals, null, 2)}`);
+  }
+
+  const exhaustive = vulnerable.replace(
+    "  d.response = response",
+    "  d.response = response\n  func() { if shouldClose() { _ = d.response.Body.Close() } else { _ = d.response.Body.Close() } }()",
+  );
+  assert.equal((await repository(exhaustive)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("recognizes only executed response owners after the waiter", async () => {
+  const invoked = vulnerable.replace(
+    "  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  return func() error { return d.response.Body.Close() }()",
+  );
+  assert.ok((await repository(invoked)).signals.some((item) => item.ruleId === ruleId));
+
+  const stored = vulnerable.replace(
+    "  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  cleanup := func() error { return d.response.Body.Close() }; _ = cleanup\n  return nil",
+  );
+  assert.equal((await repository(stored)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const deferred = vulnerable.replace(
+    "  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  defer d.response.Body.Close()\n  return nil",
+  );
+  assert.ok((await repository(deferred)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("requires cancellation IIFE synchronization on every execution path", async () => {
+  const allPaths = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { if retry() { <-d.responseReady; return }; <-d.responseReady }()\n    return d.ctx.Err()",
+  );
+  assert.equal((await repository(allPaths)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const conditional = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { if shouldWait() { <-d.responseReady } }()\n    return d.ctx.Err()",
+  );
+  assert.ok((await repository(conditional)).signals.some((item) => item.ruleId === ruleId));
+
+  const conditionalHelper = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    func() { if retry() { d.awaitLate() } }()\n    return d.ctx.Err()",
+    );
+  assert.ok((await repository(conditionalHelper)).signals.some((item) => item.ruleId === ruleId));
+});
+
 test("handles select, fallthrough, infinite-loop, and deletion-only relationship reachability", async () => {
   const unreachableOwners = [
     vulnerable.replace(

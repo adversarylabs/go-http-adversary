@@ -21816,7 +21816,7 @@ function cancellationCaseHandlesResponse(waiter, state, methods, lexicalSource, 
     if (statementSynchronizesCompletion(statement, waiter.receiver, state.completionField, lexicalSource)) return true;
     if (statement.type !== "expression_statement") return false;
     return descendants(statement, "call_expression").some((call) => {
-      if (!executesWithin(call, statement, lexicalSource) || !receiverBindingPreserved(waiter.method, waiter.receiver, call, source)) return false;
+      if (!executesWithin(call, statement, lexicalSource) || !callExecutesOnAllPathsWithinStatement(call, statement, lexicalSource) || !receiverBindingPreserved(waiter.method, waiter.receiver, call, source)) return false;
       const path = callPath(call, lexicalSource);
       if (path?.length !== 2 || path[0] !== waiter.receiver) return false;
       const helper = methods.find((method) => methodName(method, source) === path[1]);
@@ -21824,9 +21824,23 @@ function cancellationCaseHandlesResponse(waiter, state, methods, lexicalSource, 
     });
   });
 }
+function callExecutesOnAllPathsWithinStatement(call, statement, source) {
+  const statementOwner = owningFunction(statement);
+  const callOwner = owningFunction(call);
+  if (statementOwner === null || callOwner === null) return false;
+  if (sameSyntaxNode(callOwner, statementOwner)) return true;
+  if (callOwner.type !== "func_literal") return false;
+  const invocation = directInvocationOfLiteral(callOwner);
+  const body2 = callOwner.childForFieldName("body");
+  if (invocation === null || body2 === null || !executesWithin(invocation, statement, source)) return false;
+  return allPathsPerformInBlock(body2, (candidate) => {
+    if (!["expression_statement", "assignment_statement", "short_var_declaration", "return_statement"].includes(candidate.type)) return false;
+    return containsNode(candidate, call) && sameSyntaxNode(owningFunction(call), callOwner);
+  }, source);
+}
 function statementSynchronizesCompletion(statement, receiver, completionField, source) {
   if (!["expression_statement", "assignment_statement", "short_var_declaration"].includes(statement.type)) return false;
-  return [statement, ...descendants(statement, "unary_expression")].some((candidate) => {
+  if ([statement, ...descendants(statement, "unary_expression")].some((candidate) => {
     if (candidate.type !== "unary_expression" || !executesWithin(candidate, statement, source)) return false;
     if (!pathEquals(receiveTargetPath(candidate, source), [receiver, completionField])) return false;
     const owner = owningFunction(candidate);
@@ -21834,7 +21848,70 @@ function statementSynchronizesCompletion(statement, receiver, completionField, s
     if (statementOwner !== null && sameSyntaxNode(owner, statementOwner)) return true;
     const body2 = owner?.childForFieldName("body");
     return body2 !== null && body2 !== void 0 && directlyReachableInBlock(body2, candidate, source) && allPathsReachStatement(body2, candidate, source) && canCompleteNormallyAfter(body2, candidate, source);
-  });
+  })) return true;
+  const literalBody = directInvokedLiteralBody(statement, source);
+  return literalBody !== void 0 && allPathsPerformInBlock(
+    literalBody,
+    (candidate) => directStatementReceivesCompletion(candidate, receiver, completionField, source),
+    source
+  );
+}
+function directStatementReceivesCompletion(statement, receiver, completionField, source) {
+  if (!["expression_statement", "assignment_statement", "short_var_declaration", "return_statement"].includes(statement.type)) return false;
+  const owner = owningFunction(statement);
+  if (owner === null) return false;
+  return descendants(statement, "unary_expression").some(
+    (candidate) => sameSyntaxNode(owningFunction(candidate), owner) && pathEquals(receiveTargetPath(candidate, source), [receiver, completionField])
+  );
+}
+function directInvokedLiteralBody(statement, source) {
+  if (["go_statement", "defer_statement"].includes(statement.type)) return void 0;
+  for (const literal of descendants(statement, "func_literal")) {
+    const invocation = directInvocationOfLiteral(literal);
+    if (invocation === null || !executesWithin(invocation, statement, source)) continue;
+    const body2 = literal.childForFieldName("body");
+    if (body2 !== null) return body2;
+  }
+  return void 0;
+}
+function allPathsPerformInBlock(block, action, source) {
+  return allPathsPerformInSequence(topLevelStatements(block), action, source);
+}
+function allPathsPerformInSequence(statements, action, source) {
+  if (statements.length === 0) return false;
+  const [statement, ...rest] = statements;
+  if (statement === void 0) return false;
+  if (action(statement)) return true;
+  const literalBody = directInvokedLiteralBody(statement, source);
+  if (literalBody !== void 0 && allPathsPerformInBlock(literalBody, action, source)) return true;
+  if (statement.type === "if_statement") {
+    const condition = booleanLiteral(statement.childForFieldName("condition"), source);
+    const consequence = statement.childForFieldName("consequence");
+    if (consequence === null) return false;
+    const onTrue = [...controlledStatements(consequence), ...rest];
+    const alternative = statement.childForFieldName("alternative");
+    const onFalse = [...controlledStatements(alternative), ...rest];
+    if (condition === true) return allPathsPerformInSequence(onTrue, action, source);
+    if (condition === false) return allPathsPerformInSequence(onFalse, action, source);
+    return allPathsPerformInSequence(onTrue, action, source) && allPathsPerformInSequence(onFalse, action, source);
+  }
+  if (["return_statement", "goto_statement", "break_statement", "continue_statement", "fallthrough_statement"].includes(statement.type)) return false;
+  if (["expression_switch_statement", "type_switch_statement", "select_statement", "for_statement"].includes(statement.type)) return false;
+  if (statement.type === "expression_statement") {
+    const call = unwrapExpression(statement.namedChildren[0]);
+    if (call?.type === "call_expression" && pathEquals(callPath(call, source), ["panic"]) && unshadowedBuiltin(call, "panic", source)) return false;
+  }
+  return allPathsPerformInSequence(rest, action, source);
+}
+function controlledStatements(node) {
+  if (node === null) return [];
+  if (node.type === "block") return topLevelStatements(node);
+  if (node.type === "if_statement") return [node];
+  if (node.type === "else_clause") {
+    const branch = node.namedChildren.find((child) => child.type === "block" || child.type === "if_statement");
+    return controlledStatements(branch ?? null);
+  }
+  return [];
 }
 function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) {
   const body2 = publisher.method.childForFieldName("body");
@@ -21845,8 +21922,14 @@ function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) 
     if (!sameSyntaxNode(owningFunction(call), publisher.method) || call.startIndex <= publisher.assignment.endIndex || !directlyReachableInBlock(body2, call, lexicalSource)) return false;
     if (!producerCleanupPrecedesSignal(call, publisher)) return false;
     if (!sameSyntaxNode(enclosingBlock(call), enclosingBlock(publisher.assignment))) return false;
-    const path = callPath(call, lexicalSource);
-    return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) || assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]);
+    return producerCleanupClosesPublishedResponse(
+      call,
+      publisher,
+      state,
+      assignedName,
+      lexicalSource,
+      source
+    );
   });
   if (directlyClosed) return true;
   return descendants(body2, "call_expression").some((invocation) => {
@@ -21857,12 +21940,45 @@ function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) 
     if (literal?.type !== "func_literal" || callArguments(invocation).length !== 0) return false;
     const literalBody = literal.childForFieldName("body");
     if (literalBody === null) return false;
-    return descendants(literalBody, "call_expression").some((call) => {
-      if (!sameSyntaxNode(owningFunction(call), literal) || !directlyReachableInBlock(literalBody, call, lexicalSource)) return false;
-      const path = callPath(call, lexicalSource);
-      return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) || assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]);
-    });
+    return allPathsPerformInBlock(
+      literalBody,
+      (statement) => statementCallsPublishedResponseCleanup(
+        statement,
+        literal,
+        publisher,
+        state,
+        assignedName,
+        lexicalSource,
+        source
+      ),
+      lexicalSource
+    );
   });
+}
+function producerCleanupClosesPublishedResponse(call, publisher, state, assignedName, lexicalSource, source) {
+  const path = callPath(call, lexicalSource);
+  if (pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"])) {
+    return bindingPathPreserved(
+      publisher.method,
+      publisher.receiver,
+      call,
+      source,
+      publisher.assignment.endIndex
+    ) && selectorPathPreserved(
+      publisher.method,
+      [publisher.receiver, state.responseField],
+      call,
+      source,
+      publisher.assignment.endIndex
+    );
+  }
+  return assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]) && bindingPathPreserved(publisher.method, assignedName, call, source, publisher.assignment.endIndex);
+}
+function statementCallsPublishedResponseCleanup(statement, literal, publisher, state, assignedName, lexicalSource, source) {
+  if (!["expression_statement", "assignment_statement", "short_var_declaration", "defer_statement", "return_statement"].includes(statement.type)) return false;
+  return descendants(statement, "call_expression").some(
+    (call) => sameSyntaxNode(owningFunction(call), literal) && producerCleanupClosesPublishedResponse(call, publisher, state, assignedName, lexicalSource, source)
+  );
 }
 function producerCleanupPrecedesSignal(cleanup, publisher) {
   const deferredCleanup = nearestAncestorOfTypes(cleanup, /* @__PURE__ */ new Set(["defer_statement"]));
@@ -21917,11 +22033,15 @@ function responseOwners(state, waiter, methods, lexicalSource, source, bodyConsu
 }
 function responseBodyUseAfter(body2, waitCall, responsePath, source, bodyConsumerPaths) {
   return descendants(body2, "call_expression").find((call) => {
-    if (call.startIndex <= waitCall.endIndex || !sameSyntaxNode(owningFunction(call), owningFunction(waitCall)) || !directlyReachableInBlock(body2, call, source)) return false;
+    if (call.startIndex <= waitCall.endIndex || !directlyReachableInBlock(body2, call, source)) return false;
+    const waitOwner = owningFunction(waitCall);
+    const callOwner = owningFunction(call);
+    if (waitOwner === null || callOwner === null) return false;
+    if (!sameSyntaxNode(callOwner, waitOwner) && !executesWithin(call, body2, source)) return false;
     const path = callPath(call, source);
     const bodyPath = [...responsePath, "Body"];
-    const owner = owningFunction(waitCall);
-    if (owner === null || !bindingPathPreserved(owner, responsePath[0], call, source, waitCall.endIndex)) return false;
+    const owner = waitOwner;
+    if (!bindingPathPreserved(owner, responsePath[0], call, source, waitCall.endIndex)) return false;
     if (pathEquals(path, [...bodyPath, "Close"]) || pathEquals(path, [...bodyPath, "Read"])) return true;
     if (path === void 0 || !bodyConsumerPaths.has(path.join("."))) return false;
     if (!localNameUnshadowedAtUse(owner, path[0], call, source)) return false;
@@ -22097,6 +22217,19 @@ function bindingPathPreserved(owner, name2, use, source, afterIndex) {
   if (rangeAssignmentChangesBinding(owner, name2, use, source, afterIndex)) return false;
   if (lexicalControlBindingShadows(owner, name2, use, source)) return false;
   return true;
+}
+function selectorPathPreserved(owner, path, use, source, afterIndex) {
+  return !descendants(owner, "assignment_statement").some((assignment) => {
+    if (assignment.startIndex <= afterIndex || assignment.endIndex >= use.startIndex || !executesBeforeUse(owner, assignment, use, source)) return false;
+    const left = assignmentSides(assignment)?.left;
+    if (left === void 0) return false;
+    if ([left, ...descendants(left, "selector_expression")].some(
+      (candidate) => pathEquals(selectorPath(candidate, source), path)
+    )) return true;
+    return sourceText(left, source).split(",").some(
+      (candidate) => candidate.replace(/\s/g, "") === path.join(".")
+    );
+  });
 }
 function executesBeforeUse(owner, node, use, source) {
   const body2 = owner.childForFieldName("body");
