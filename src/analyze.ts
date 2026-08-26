@@ -467,7 +467,9 @@ function cancellationCaseHandlesResponse(
   if (returnIndex < 0) return false;
   return topLevel.slice(0, returnIndex).some((statement, index) => {
     if (!priorStatementsCannotBypass(topLevel.slice(0, index), waiter.method, lexicalSource)) return false;
-    if (statementSynchronizesCompletion(statement, waiter.receiver, state.completionField, lexicalSource)) return true;
+    if (statementSynchronizesCompletion(
+      statement, waiter.receiver, state.completionField, lexicalSource, waiter.method, source,
+    )) return true;
     if (statement.type !== "expression_statement") return false;
     return descendants(statement, "call_expression").some((call) => {
       if (!executesWithin(call, statement, lexicalSource) ||
@@ -502,12 +504,20 @@ function statementSynchronizesCompletion(
   receiver: string,
   completionField: string,
   source: string,
+  bindingOwner?: Node,
+  bindingSource?: string,
 ): boolean {
+  const bindingPreserved = (use: Node): boolean => {
+    if (bindingOwner === undefined || bindingSource === undefined) return true;
+    const body = bindingOwner.childForFieldName("body");
+    return body !== null && bindingPathPreserved(bindingOwner, receiver, use, bindingSource, body.startIndex);
+  };
   const directReceiveStatement = ["expression_statement", "assignment_statement", "short_var_declaration"]
     .includes(statement.type);
   if (directReceiveStatement && [statement, ...descendants(statement, "unary_expression")].some((candidate) => {
     if (candidate.type !== "unary_expression" || !executesWithin(candidate, statement, source)) return false;
     if (!pathEquals(receiveTargetPath(candidate, source), [receiver, completionField])) return false;
+    if (!bindingPreserved(candidate)) return false;
     const owner = owningFunction(candidate);
     const statementOwner = owningFunction(statement);
     if (statementOwner !== null && sameSyntaxNode(owner, statementOwner)) return true;
@@ -519,7 +529,8 @@ function statementSynchronizesCompletion(
 
   return allPathsPerformInSequence(
     [statement],
-    (candidate) => directStatementReceivesCompletion(candidate, receiver, completionField, source),
+    (candidate) => directStatementReceivesCompletion(candidate, receiver, completionField, source) &&
+      bindingPreserved(candidate),
     source,
   );
 }
@@ -643,7 +654,10 @@ function switchCasePath(cases: Node[], index: number, continuation: Node[], sour
   const transfer = statements[transferIndex]!;
   const prefix = statements.slice(0, transferIndex);
   if (transfer.type === "break_statement") {
-    return sourceText(transfer, source).trim() === "break" ? [...prefix, ...continuation] : undefined;
+    const control = nearestAncestorOfTypes(cases[index]!, new Set(["expression_switch_statement"]));
+    return control !== null && breakTargetsControl(transfer, control, source)
+      ? [...prefix, ...continuation]
+      : undefined;
   }
   if (transferIndex !== statements.length - 1 || index + 1 >= cases.length) return undefined;
   const following = switchCasePath(cases, index + 1, continuation, source);
@@ -655,7 +669,8 @@ function selectCasePath(caseNode: Node, continuation: Node[], source: string): N
   const breakIndex = statements.findIndex((statement) => statement.type === "break_statement");
   if (breakIndex < 0) return [caseNode, ...statements, ...continuation];
   const transfer = statements[breakIndex]!;
-  if (sourceText(transfer, source).trim() !== "break") return undefined;
+  const control = nearestAncestorOfTypes(caseNode, new Set(["select_statement"]));
+  if (control === null || !breakTargetsControl(transfer, control, source)) return undefined;
   return [caseNode, ...statements.slice(0, breakIndex), ...continuation];
 }
 
@@ -855,7 +870,9 @@ function callerReobservesCompletion(
   if (owner === null) return false;
   return topLevelStatements(body).some((statement) => {
     if (statement.startIndex <= waitCall.endIndex || statement.endIndex >= bodyUse.startIndex) return false;
-    if (statementSynchronizesCompletion(statement, receiver, state.completionField, lexicalSource)) return true;
+    if (statementSynchronizesCompletion(
+      statement, receiver, state.completionField, lexicalSource, owner, source,
+    )) return true;
     if (statement.type !== "expression_statement") return false;
     return descendants(statement, "call_expression").some((call) => {
       if (!executesWithin(call, statement, lexicalSource) ||
@@ -963,7 +980,7 @@ function helperSynchronizesCompletion(
   if (body === null || receiver === undefined) return false;
   const statements = topLevelStatements(body);
   const receive = statements.find((statement) =>
-    statementSynchronizesCompletion(statement, receiver, state.completionField, lexicalSource)
+    statementSynchronizesCompletion(statement, receiver, state.completionField, lexicalSource, method, source)
   );
   if (receive === undefined || !directlyReachableInBlock(body, receive, lexicalSource)) return false;
   if (!receiverBindingPreserved(method, receiver, receive, source)) return false;
@@ -1007,13 +1024,42 @@ function priorStatementsCannotBypass(statements: Node[], owner: Node, source: st
 }
 
 function breakEscapesStatement(breakStatement: Node, statement: Node, source: string): boolean {
-  if (sourceText(breakStatement, source).trim() !== "break") return true;
-  const target = nearestAncestorOfTypes(breakStatement, new Set([
-    "expression_switch_statement",
-    "type_switch_statement",
-    "select_statement",
-  ]));
+  const target = breakTargetControl(breakStatement, source);
   return target === null || !containsNode(statement, target);
+}
+
+function breakTargetsControl(breakStatement: Node, control: Node, source: string): boolean {
+  return sameSyntaxNode(breakTargetControl(breakStatement, source), control);
+}
+
+function breakTargetControl(breakStatement: Node, source: string): Node | null {
+  const text = sourceText(breakStatement, source).trim();
+  if (text === "break") {
+    return nearestAncestorOfTypes(breakStatement, new Set([
+      "for_statement",
+      "expression_switch_statement",
+      "type_switch_statement",
+      "select_statement",
+    ]));
+  }
+  const label = /^break\s+([A-Za-z_]\w*)$/.exec(text)?.[1];
+  if (label === undefined) return null;
+  let current = breakStatement.parent;
+  while (current !== null) {
+    if (current.type === "labeled_statement") {
+      const declared = current.namedChildren.find((child) => child.type === "label_name" || child.type === "identifier");
+      if (declared !== undefined && sourceText(declared, source).trim() === label) {
+        return current.namedChildren.find((child) => [
+          "for_statement",
+          "expression_switch_statement",
+          "type_switch_statement",
+          "select_statement",
+        ].includes(child.type)) ?? null;
+      }
+    }
+    current = current.parent;
+  }
+  return null;
 }
 
 function canCompleteNormallyAfter(body: Node, node: Node, source: string): boolean {
@@ -1086,7 +1132,8 @@ function bindingPathPreserved(
     if (assignment.startIndex <= afterIndex || assignment.endIndex >= use.startIndex) continue;
     if (!executesBeforeUse(owner, assignment, use, source)) continue;
     const left = assignmentSides(assignment)?.left;
-    if (left !== undefined && directlyAssignsIdentifier(left, name, source)) return false;
+    if (left !== undefined && directlyAssignsIdentifier(left, name, source) &&
+      !assignmentPreservesIdentifier(assignment, name, source)) return false;
   }
   for (const declaration of [
     ...descendants(owner, "short_var_declaration"),
@@ -1099,6 +1146,7 @@ function bindingPathPreserved(
     if (scope !== null && containsNode(scope, use)) return false;
   }
   if (rangeAssignmentChangesBinding(owner, name, use, source, afterIndex)) return false;
+  if (communicationAssignmentChangesBinding(owner, name, use, source, afterIndex)) return false;
   if (lexicalControlBindingShadows(owner, name, use, source)) return false;
   return true;
 }
@@ -1154,6 +1202,22 @@ function rangeAssignmentChangesBinding(
   });
 }
 
+function communicationAssignmentChangesBinding(
+  owner: Node,
+  name: string,
+  use: Node,
+  source: string,
+  afterIndex: number,
+): boolean {
+  const escaped = escapeRegExp(name);
+  return descendants(owner, "communication_case").some((clause) => {
+    if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex || !containsNode(clause, use)) return false;
+    const statements = clause.namedChildren.find((child) => child.type === "statement_list");
+    const header = source.slice(clause.startIndex, statements?.startIndex ?? clause.endIndex);
+    return new RegExp(`(?:^|[,;\\s])${escaped}\\s*=(?!=)`).test(header);
+  });
+}
+
 function directlyAssignsIdentifier(node: Node, name: string, source: string): boolean {
   const candidate = unwrapExpression(node);
   if (candidate?.type === "identifier") return sourceText(candidate, source).trim() === name;
@@ -1161,6 +1225,15 @@ function directlyAssignsIdentifier(node: Node, name: string, source: string): bo
   return candidate.namedChildren.some((child) =>
     child.type === "identifier" && sourceText(child, source).trim() === name
   );
+}
+
+function assignmentPreservesIdentifier(assignment: Node, name: string, source: string): boolean {
+  const sides = assignmentSides(assignment);
+  if (sides === undefined || sides.left.type !== "identifier") return false;
+  if (sourceText(sides.left, source).trim() !== name ||
+    source.slice(sides.left.endIndex, sides.right.startIndex).trim() !== "=") return false;
+  const right = unwrapExpression(sides.right);
+  return right?.type === "identifier" && sourceText(right, source).trim() === name;
 }
 
 function localNameUnshadowedAtUse(owner: Node, name: string, use: Node, source: string): boolean {
@@ -1323,6 +1396,17 @@ function directlyReachableInBlock(block: Node, node: Node, source: string): bool
     )) return false;
     return directlyReachableInBlock(block, expressionCase, source);
   }
+  const communicationCase = enclosingCommunicationCase(node, block);
+  if (communicationCase !== undefined) {
+    const statements = communicationCase.namedChildren.find((child) => child.type === "statement_list");
+    const statement = statements?.namedChildren.find((candidate) => containsNode(candidate, node));
+    if (statements === undefined || statement === undefined) return false;
+    if (statements.namedChildren.some((candidate) =>
+      candidate.endIndex < statement.startIndex &&
+      unconditionallyTerminatesBefore(statements, candidate, statement, source)
+    )) return false;
+    return directlyReachableInBlock(block, communicationCase, source);
+  }
   let target = node;
   let currentBlock = enclosingBlock(node);
   while (currentBlock !== null) {
@@ -1345,6 +1429,15 @@ function enclosingExpressionCase(node: Node, boundary: Node): Node | undefined {
   let current = node.parent;
   while (current !== null && !sameSyntaxNode(current, boundary)) {
     if (current.type === "expression_case") return current;
+    current = current.parent;
+  }
+  return undefined;
+}
+
+function enclosingCommunicationCase(node: Node, boundary: Node): Node | undefined {
+  let current = node.parent;
+  while (current !== null && !sameSyntaxNode(current, boundary)) {
+    if (current.type === "communication_case") return current;
     current = current.parent;
   }
   return undefined;

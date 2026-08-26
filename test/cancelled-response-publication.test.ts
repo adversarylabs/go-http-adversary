@@ -1165,7 +1165,19 @@ test("follows switch fallthrough and break transfers to a common completion wait
     <-d.responseReady
     return d.ctx.Err()`,
   );
-  for (const source of [fallthroughSwitch, breakingSwitch, breakingSelect]) {
+  const conditionalSwitchBreak = breakingSwitch.replace("      break\n    default:", "      if retry() { break }\n      observeOnly()\n    default:");
+  const conditionalSelectBreak = breakingSelect.replace("      break\n    default:", "      if retry() { break }\n      observeOnly()\n    default:");
+  const labeledSwitchBreak = breakingSwitch
+    .replace("    switch mode()", "  choose:\n    switch mode()")
+    .replaceAll("      break", "      break choose");
+  for (const source of [
+    fallthroughSwitch,
+    breakingSwitch,
+    breakingSelect,
+    conditionalSwitchBreak,
+    conditionalSelectBreak,
+    labeledSwitchBreak,
+  ]) {
     assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
   }
 
@@ -1175,6 +1187,26 @@ test("follows switch fallthrough and break transfers to a common completion wait
   assert.ok((await repository(bypassingSwitch)).signals.some((item) => item.ruleId === ruleId));
   const bypassingSelect = breakingSelect.replace("case <-otherReady():\n      break", "case <-otherReady():\n      return d.ctx.Err()");
   assert.ok((await repository(bypassingSelect)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("binds cancellation synchronization and waiter guards to the original values", async () => {
+  const receiverVariants = [
+    "d = other\n    <-d.responseReady",
+    "d := other\n    <-d.responseReady",
+  ];
+  for (const replacement of receiverVariants) {
+    const source = ("var other *duplexHTTPCall\n\n" + vulnerable).replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      `case <-d.ctx.Done():\n    ${replacement}\n    return d.ctx.Err()`,
+    );
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const selfAssignment = vulnerable.replace(
+    "  _ = d.BlockUntilResponseReady()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "  err := d.BlockUntilResponseReady()\n  err = err\n  if err != nil { return err }\n  _, err = d.response.Body.Read(nil)\n  return err",
+  );
+  assert.equal((await repository(selfAssignment)).signals.some((item) => item.ruleId === ruleId), false);
 });
 
 test("handles select, fallthrough, infinite-loop, and deletion-only relationship reachability", async () => {
