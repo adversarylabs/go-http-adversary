@@ -1067,6 +1067,68 @@ test("requires cancellation IIFE synchronization on every execution path", async
   assert.ok((await repository(conditionalHelper)).signals.some((item) => item.ruleId === ruleId));
 });
 
+test("keeps inline and split waiter error guards equivalent for response cleanup", async () => {
+  const variants = [
+    vulnerable.replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  if err := d.BlockUntilResponseReady(); err != nil { return err }",
+    ),
+    vulnerable.replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  err := d.BlockUntilResponseReady()\n  if err != nil { return err }",
+    ),
+  ];
+  for (const source of variants) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
+test("accepts only exhaustive switch and select cancellation synchronization", async () => {
+  const exhaustiveSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch mode() {
+    case 1:
+      <-d.responseReady
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  const exhaustiveSelect = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    select {
+    case <-d.responseReady:
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  const exhaustiveBlockingSelect = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    select {
+    case <-d.responseReady:
+    case <-otherReady():
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  for (const source of [exhaustiveSwitch, exhaustiveSelect, exhaustiveBlockingSelect]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const conditionalSwitch = exhaustiveSwitch.replace("default:\n      <-d.responseReady", "default:");
+  assert.ok((await repository(conditionalSwitch)).signals.some((item) => item.ruleId === ruleId));
+
+  const partialBlockingSelect = exhaustiveBlockingSelect.replace(
+    "case <-otherReady():\n      <-d.responseReady",
+    "case <-otherReady():",
+  );
+  assert.ok((await repository(partialBlockingSelect)).signals.some((item) => item.ruleId === ruleId));
+});
+
 test("handles select, fallthrough, infinite-loop, and deletion-only relationship reachability", async () => {
   const unreachableOwners = [
     vulnerable.replace(

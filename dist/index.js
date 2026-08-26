@@ -21839,8 +21839,8 @@ function callExecutesOnAllPathsWithinStatement(call, statement, source) {
   }, source);
 }
 function statementSynchronizesCompletion(statement, receiver, completionField, source) {
-  if (!["expression_statement", "assignment_statement", "short_var_declaration"].includes(statement.type)) return false;
-  if ([statement, ...descendants(statement, "unary_expression")].some((candidate) => {
+  const directReceiveStatement = ["expression_statement", "assignment_statement", "short_var_declaration"].includes(statement.type);
+  if (directReceiveStatement && [statement, ...descendants(statement, "unary_expression")].some((candidate) => {
     if (candidate.type !== "unary_expression" || !executesWithin(candidate, statement, source)) return false;
     if (!pathEquals(receiveTargetPath(candidate, source), [receiver, completionField])) return false;
     const owner = owningFunction(candidate);
@@ -21849,14 +21849,16 @@ function statementSynchronizesCompletion(statement, receiver, completionField, s
     const body2 = owner?.childForFieldName("body");
     return body2 !== null && body2 !== void 0 && directlyReachableInBlock(body2, candidate, source) && allPathsReachStatement(body2, candidate, source) && canCompleteNormallyAfter(body2, candidate, source);
   })) return true;
-  const literalBody = directInvokedLiteralBody(statement, source);
-  return literalBody !== void 0 && allPathsPerformInBlock(
-    literalBody,
+  return allPathsPerformInSequence(
+    [statement],
     (candidate) => directStatementReceivesCompletion(candidate, receiver, completionField, source),
     source
   );
 }
 function directStatementReceivesCompletion(statement, receiver, completionField, source) {
+  if (statement.type === "communication_case") {
+    return communicationReceiveTextMatches(waitReceiveNode(statement), source, receiver, completionField);
+  }
   if (!["expression_statement", "assignment_statement", "short_var_declaration", "return_statement"].includes(statement.type)) return false;
   const owner = owningFunction(statement);
   if (owner === null) return false;
@@ -21895,13 +21897,40 @@ function allPathsPerformInSequence(statements, action, source) {
     if (condition === false) return allPathsPerformInSequence(onFalse, action, source);
     return allPathsPerformInSequence(onTrue, action, source) && allPathsPerformInSequence(onFalse, action, source);
   }
+  if (statement.type === "expression_switch_statement") {
+    const cases = directControlCases(statement, "expression_case");
+    if (cases.length === 0 || !cases.some((candidate) => isDefaultCase(candidate, source))) return false;
+    return cases.every((candidate) => allPathsPerformInSequence(
+      [...caseStatements(candidate), ...rest],
+      action,
+      source
+    ));
+  }
+  if (statement.type === "select_statement") {
+    const cases = directControlCases(statement, "communication_case");
+    if (cases.length === 0) return false;
+    return cases.every((candidate) => allPathsPerformInSequence(
+      [candidate, ...caseStatements(candidate), ...rest],
+      action,
+      source
+    ));
+  }
   if (["return_statement", "goto_statement", "break_statement", "continue_statement", "fallthrough_statement"].includes(statement.type)) return false;
-  if (["expression_switch_statement", "type_switch_statement", "select_statement", "for_statement"].includes(statement.type)) return false;
+  if (["type_switch_statement", "for_statement"].includes(statement.type)) return false;
   if (statement.type === "expression_statement") {
     const call = unwrapExpression(statement.namedChildren[0]);
     if (call?.type === "call_expression" && pathEquals(callPath(call, source), ["panic"]) && unshadowedBuiltin(call, "panic", source)) return false;
   }
   return allPathsPerformInSequence(rest, action, source);
+}
+function directControlCases(control, type) {
+  return [...descendants(control, type), ...descendants(control, "default_case")].filter((candidate) => {
+    const boundaryType = type === "expression_case" ? "expression_switch_statement" : "select_statement";
+    return sameSyntaxNode(nearestAncestorOfTypes(candidate, /* @__PURE__ */ new Set([boundaryType])), control);
+  });
+}
+function caseStatements(caseNode) {
+  return caseNode.namedChildren.find((child) => child.type === "statement_list")?.namedChildren ?? [];
 }
 function controlledStatements(node) {
   if (node === null) return [];
@@ -21912,6 +21941,9 @@ function controlledStatements(node) {
     return controlledStatements(branch ?? null);
   }
   return [];
+}
+function communicationReceiveTextMatches(node, source, receiver, field) {
+  return pathEquals(receiveTargetPath(node, source), [receiver, field]);
 }
 function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) {
   const body2 = publisher.method.childForFieldName("body");
@@ -22000,9 +22032,9 @@ function responseOwners(state, waiter, methods, lexicalSource, source, bodyConsu
       (call) => sameSyntaxNode(owningFunction(call), method) && isDirectStatement(body2, call) && directlyReachableInBlock(body2, call, lexicalSource) && receiverBindingPreserved(method, receiver, call, source) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
     );
     for (const waitCall of waitCalls) {
-      if (waitCallHasTerminatingErrorGuard(waitCall, lexicalSource)) continue;
       const bodyUse = responseBodyUseAfter(body2, waitCall, [receiver, state.responseField], lexicalSource, bodyConsumerPaths);
       if (bodyUse === void 0) continue;
+      if (waitCallHasTerminatingErrorGuard(waitCall, bodyUse, lexicalSource) && !responseBodyUseCloses(bodyUse, lexicalSource)) continue;
       if (hasUnconditionalTerminationBetween(body2, waitCall, bodyUse, lexicalSource)) continue;
       if (callerReobservesCompletion(
         body2,
@@ -22064,21 +22096,39 @@ function callerReobservesCompletion(body2, waitCall, bodyUse, receiver, state, m
     });
   });
 }
-function waitCallHasTerminatingErrorGuard(waitCall, source) {
+function responseBodyUseCloses(bodyUse, source) {
+  const path = callPath(bodyUse, source);
+  return path !== void 0 && path.length >= 2 && path.at(-2) === "Body" && path.at(-1) === "Close";
+}
+function waitCallHasTerminatingErrorGuard(waitCall, bodyUse, source) {
   let current = waitCall.parent;
   while (current !== null && current.type !== "if_statement") {
     if (current.type === "statement_list" || current.type === "block") return false;
     current = current.parent;
   }
-  if (current === null) return false;
-  const initializer = current.namedChildren.find((child) => child.type === "short_var_declaration");
-  const consequence = current.namedChildren.find((child) => child.type === "block");
-  if (initializer === void 0 || consequence === void 0 || !containsNode(initializer, waitCall)) return false;
-  const sides = assignmentSides(initializer);
-  if (sides?.left.type !== "identifier") return false;
-  const errorName = sourceText(sides.left, source).trim();
-  const condition = current.namedChildren.find((child) => child.type === "binary_expression");
-  if (condition === void 0 || sourceText(condition, source).replace(/\s/g, "") !== `${errorName}!=nil`) return false;
+  if (current !== null) {
+    const initializer = current.namedChildren.find((child) => child.type === "short_var_declaration");
+    if (initializer !== void 0 && containsNode(initializer, waitCall)) {
+      const sides = assignmentSides(initializer);
+      if (sides?.left.type !== "identifier") return false;
+      return errorGuardReturns(current, sourceText(sides.left, source).trim(), source);
+    }
+  }
+  const errorName = assignedIdentifier(waitCall, source);
+  const owner = owningFunction(waitCall);
+  const body2 = owner?.childForFieldName("body");
+  if (errorName === void 0 || owner === null || body2 == null) return false;
+  const waitStatement = topLevelStatementContaining(body2, waitCall);
+  const useStatement = topLevelStatementContaining(body2, bodyUse);
+  if (waitStatement === void 0 || useStatement === void 0) return false;
+  return topLevelStatements(body2).some(
+    (statement) => statement.type === "if_statement" && statement.startIndex > waitStatement.endIndex && statement.endIndex < useStatement.startIndex && errorGuardReturns(statement, errorName, source)
+  );
+}
+function errorGuardReturns(guard, errorName, source) {
+  const condition = guard.childForFieldName("condition");
+  const consequence = guard.childForFieldName("consequence");
+  if (condition === null || consequence === null || sourceText(condition, source).replace(/\s/g, "") !== `${errorName}!=nil`) return false;
   return topLevelStatements(consequence).some((statement) => statement.type === "return_statement");
 }
 function responseWaitWrappers(state, waiter, methods, lexicalSource, source) {
