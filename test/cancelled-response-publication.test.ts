@@ -1371,6 +1371,84 @@ test("select receiver invalidation is reachable, lexical, and deletion-aware", a
   assert.equal(signal.line, line);
 });
 
+test("tracks captured receiver mutation through executed closure value lineage", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const mutation = "func() { select { case d = <-calls: default: } }";
+  const variants = [
+    `mutate := ${mutation}; alias := mutate; alias()`,
+    `mutate := ${mutation}; mutate = mutate; mutate()`,
+    `mutate := ${mutation}; if false { mutate = func() {} }; mutate()`,
+    `mutate := ${mutation}; if enabled() { mutate = func() {} }; mutate()`,
+    `mutate := ${mutation}; mutate(); mutate = func() {}`,
+    `mutate := ${mutation}; cleanup := func() {}; cleanup = func() {}; mutate()`,
+    `mutate := ${mutation}; { mutate := func() {}; mutate() }; mutate()`,
+    `mutate := ${mutation}; if enabled() { mutate() }`,
+    `mutate := ${mutation}; func() { mutate() }()`,
+    `var mutate = ${mutation}; mutate()`,
+    "mutate := func(_ bool) { select { case d = <-calls: default: } }; mutate(true)",
+  ];
+  for (const [index, statements] of variants.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.equal(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      false,
+      `lineage variant ${index}`,
+    );
+  }
+
+  const aliasSurvivesReassignment = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; alias := mutate; mutate = func() {}; alias()\n  _ = d.BlockUntilResponseReady()`,
+  );
+  assert.equal(
+    (await repository(aliasSurvivesReassignment)).signals.some((item) => item.ruleId === ruleId),
+    false,
+  );
+
+  const nonInvocations = [
+    `mutate := ${mutation}; mutate = func() {}; mutate()`,
+    `mutate := ${mutation}; if enabled() { mutate = func() {}; mutate() }`,
+    `mutate := ${mutation}; { mutate := func() {}; mutate() }`,
+    `mutate := ${mutation}; go mutate()`,
+    `mutate := ${mutation}; defer mutate()`,
+    `mutate := ${mutation}; wrapper := func() { mutate() }; _ = wrapper`,
+  ];
+  for (const [index, statements] of nonInvocations.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      `non-invocation ${index}`,
+    );
+  }
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; mutate()\n  _ = d.BlockUntilResponseReady()`,
+  );
+  const current = previous.replace("mutate()", "_ = mutate");
+  const line = lineOf(current, "_ = mutate");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
 test("harmless work around a waiter error guard does not make late cancellation safe", async () => {
   const variants = [
     "waitErr := d.BlockUntilResponseReady()\n  observe()\n  if waitErr != nil { return waitErr }",
