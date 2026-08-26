@@ -21556,7 +21556,13 @@ function cancelledResponsePublicationSignals(file, root, previousRoot) {
             waiter,
             owner
           );
-          const evidence = firstChangedNode(file, root, previousRoot, evidenceNodes) ?? (file.status === "modified" && file.previous !== void 0 && goSourceSemantics(file.current) !== goSourceSemantics(file.previous) && !previousSignatures.has(currentSignature) ? publisher.asyncStart : void 0);
+          const newlyActivated = file.status === "modified" && file.previous !== void 0 && goSourceSemantics(file.current) !== goSourceSemantics(file.previous) && !previousSignatures.has(currentSignature);
+          const evidence = firstChangedNode(file, root, previousRoot, evidenceNodes) ?? (newlyActivated ? firstChangedNode(
+            file,
+            root,
+            previousRoot,
+            cancellationActivationStatements(waiter.cancellationCase)
+          ) ?? publisher.asyncStart : void 0);
           if (evidence === void 0) continue;
           signals.push({
             ruleId: "go-http.cancelled-response-publication",
@@ -21911,7 +21917,8 @@ function allPathsPerformInSequence(statements, action, source) {
     return allPathsPerformInSequence(onTrue, action, source) && allPathsPerformInSequence(onFalse, action, source);
   }
   if (statement.type === "expression_switch_statement" || statement.type === "type_switch_statement") {
-    const cases = directControlCases(statement, "expression_case");
+    const caseType = statement.type === "expression_switch_statement" ? "expression_case" : "type_case";
+    const cases = directControlCases(statement, caseType);
     if (cases.length === 0 || !cases.some((candidate) => isDefaultCase(candidate, source))) return false;
     return cases.every((_, index) => {
       const path = switchCasePath(cases, index, rest, source);
@@ -22401,8 +22408,7 @@ function communicationAssignmentChangesBinding(owner, name2, use, source, afterI
     if (containsNode(clause, use)) return true;
     const selection = nearestAncestorOfTypes(clause, /* @__PURE__ */ new Set(["select_statement"]));
     if (selection === null || selection.endIndex >= use.startIndex) return false;
-    const cases = directControlCases(selection, "communication_case");
-    return cases.length === 1 && !cases.some((candidate) => isDefaultCase(candidate, source));
+    return true;
   });
 }
 function directlyAssignsIdentifier(node, name2, source) {
@@ -22460,6 +22466,15 @@ function controlActivationNodes(node, boundary) {
     current = current.parent;
   }
   return nodes.reverse();
+}
+function cancellationActivationStatements(cancellationCase) {
+  return [
+    ...descendants(cancellationCase, "expression_statement"),
+    ...descendants(cancellationCase, "assignment_statement"),
+    ...descendants(cancellationCase, "short_var_declaration"),
+    ...descendants(cancellationCase, "send_statement"),
+    ...descendants(cancellationCase, "inc_statement")
+  ].sort((left, right) => left.startIndex - right.startIndex);
 }
 function receiveTargetPath(node, source) {
   const owner = owningFunction(node);

@@ -138,11 +138,17 @@ function cancelledResponsePublicationSignals(file: SourceRevision, root: Node, p
             waiter,
             owner,
           );
+          const newlyActivated = file.status === "modified" && file.previous !== undefined &&
+            goSourceSemantics(file.current) !== goSourceSemantics(file.previous) &&
+            !previousSignatures.has(currentSignature);
           const evidence = firstChangedNode(file, root, previousRoot, evidenceNodes) ??
-            (file.status === "modified" && file.previous !== undefined &&
-                goSourceSemantics(file.current) !== goSourceSemantics(file.previous) &&
-                !previousSignatures.has(currentSignature)
-              ? publisher.asyncStart
+            (newlyActivated
+              ? firstChangedNode(
+                file,
+                root,
+                previousRoot,
+                cancellationActivationStatements(waiter.cancellationCase),
+              ) ?? publisher.asyncStart
               : undefined);
           if (evidence === undefined) continue;
 
@@ -600,7 +606,8 @@ function allPathsPerformInSequence(
   }
 
   if (statement.type === "expression_switch_statement" || statement.type === "type_switch_statement") {
-    const cases = directControlCases(statement, "expression_case");
+    const caseType = statement.type === "expression_switch_statement" ? "expression_case" : "type_case";
+    const cases = directControlCases(statement, caseType);
     if (cases.length === 0 || !cases.some((candidate) => isDefaultCase(candidate, source))) return false;
     return cases.every((_, index) => {
       const path = switchCasePath(cases, index, rest, source);
@@ -632,7 +639,10 @@ function allPathsPerformInSequence(
   return allPathsPerformInSequence(rest, action, source);
 }
 
-function directControlCases(control: Node, type: "expression_case" | "communication_case"): Node[] {
+function directControlCases(
+  control: Node,
+  type: "expression_case" | "type_case" | "communication_case",
+): Node[] {
   return [...descendants(control, type), ...descendants(control, "default_case")]
     .filter((candidate) => {
       return sameSyntaxNode(nearestAncestorOfTypes(candidate, new Set([control.type])), control);
@@ -1225,8 +1235,10 @@ function communicationAssignmentChangesBinding(
     if (containsNode(clause, use)) return true;
     const selection = nearestAncestorOfTypes(clause, new Set(["select_statement"]));
     if (selection === null || selection.endIndex >= use.startIndex) return false;
-    const cases = directControlCases(selection, "communication_case");
-    return cases.length === 1 && !cases.some((candidate) => isDefaultCase(candidate, source));
+    // A receive assignment in any selectable arm makes the receiver reaching a
+    // later use path-dependent. Do not attribute that use to the pre-select
+    // receiver, even when another arm or a default could preserve it.
+    return true;
   });
 }
 
@@ -1291,6 +1303,16 @@ function controlActivationNodes(node: Node, boundary: Node | null): Node[] {
     current = current.parent;
   }
   return nodes.reverse();
+}
+
+function cancellationActivationStatements(cancellationCase: Node): Node[] {
+  return [
+    ...descendants(cancellationCase, "expression_statement"),
+    ...descendants(cancellationCase, "assignment_statement"),
+    ...descendants(cancellationCase, "short_var_declaration"),
+    ...descendants(cancellationCase, "send_statement"),
+    ...descendants(cancellationCase, "inc_statement"),
+  ].sort((left, right) => left.startIndex - right.startIndex);
 }
 
 function receiveTargetPath(node: Node, source: string): string[] | undefined {

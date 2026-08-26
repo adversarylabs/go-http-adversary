@@ -1209,12 +1209,24 @@ test("binds cancellation synchronization and waiter guards to the original value
   assert.equal((await repository(selfAssignment)).signals.some((item) => item.ruleId === ruleId), false);
 });
 
-test("tracks guaranteed select rebinding and exhaustive type-switch synchronization", async () => {
+test("tracks select rebinding and exhaustive type-switch synchronization", async () => {
   const reboundOwner = ("var calls chan *duplexHTTPCall\n\n" + vulnerable).replace(
     "  _ = d.BlockUntilResponseReady()",
     "  select { case d = <-calls: }\n  _ = d.BlockUntilResponseReady()",
   );
   assert.equal((await repository(reboundOwner)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const conditionalReboundOwner = ("var calls chan *duplexHTTPCall\n\n" + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: default: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(conditionalReboundOwner)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const everyArmReboundOwner = ("var calls, calls2 chan *duplexHTTPCall\n\n" + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: case d = <-calls2: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(everyArmReboundOwner)).signals.some((item) => item.ruleId === ruleId), false);
 
   const exhaustiveTypeSwitch = vulnerable.replace(
     "case <-d.ctx.Done():\n    return d.ctx.Err()",
@@ -1230,6 +1242,36 @@ test("tracks guaranteed select rebinding and exhaustive type-switch synchronizat
     return d.ctx.Err()`,
   );
   assert.equal((await repository(exhaustiveTypeSwitch)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const partialTypeSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch any(mode()).(type) {
+    case int:
+      observe()
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  assert.ok((await repository(partialTypeSwitch)).signals.some((item) => item.ruleId === ruleId));
+
+  const safeTypeSwitch = partialTypeSwitch.replace("    case int:\n      observe()", "    case int:\n      <-d.responseReady");
+  const changedLine = lineOf(partialTypeSwitch, "observe()");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current: partialTypeSwitch,
+      previous: safeTypeSwitch,
+      status: "modified",
+      changedLines: new Set([changedLine]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, changedLine);
 });
 
 test("harmless work around a waiter error guard does not make late cancellation safe", async () => {
