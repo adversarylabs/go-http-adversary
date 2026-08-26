@@ -21519,6 +21519,12 @@ function cancelledResponsePublicationSignals(file, root, previousRoot) {
   const lexicalFile = maskGoLexicalNoise(root, file.current);
   const methods = descendants(root, "method_declaration");
   const bodyConsumerPaths = standardBodyConsumerPaths(root, file.current);
+  const previousSignatures = previousRoot === void 0 || file.previous === void 0 ? /* @__PURE__ */ new Set() : new Set(cancelledResponsePublicationSignals({
+    path: file.path,
+    current: file.previous,
+    status: "repository",
+    changedLines: /* @__PURE__ */ new Set()
+  }, previousRoot).map(cancelledResponsePublicationSignature));
   const signals = [];
   for (const state of ownedResponseStates(root, file.current, httpAliases, contextAliases)) {
     const typeMethods = methods.filter((method) => methodReceiverType(method, file.current) === state.typeName);
@@ -21530,7 +21536,7 @@ function cancelledResponsePublicationSignals(file, root, previousRoot) {
         if (cancellationCaseHandlesResponse(waiter, state, typeMethods, lexicalFile, file.current)) continue;
         const owners = responseOwners(state, waiter, typeMethods, lexicalFile, file.current, bodyConsumerPaths);
         for (const owner of owners) {
-          const evidence = firstChangedNode(file, root, previousRoot, [
+          const evidenceNodes = [
             state.responseDeclaration,
             state.completionDeclaration,
             ...controlActivationNodes(publisher.asyncStart, publisher.method.childForFieldName("body")),
@@ -21543,7 +21549,14 @@ function cancelledResponsePublicationSignals(file, root, previousRoot) {
             owner.waitCall,
             ...controlActivationNodes(owner.bodyUse, owner.method.childForFieldName("body")),
             owner.bodyUse
-          ]);
+          ];
+          const currentSignature = cancelledResponsePublicationSignatureParts(
+            state,
+            publisher,
+            waiter,
+            owner
+          );
+          const evidence = firstChangedNode(file, root, previousRoot, evidenceNodes) ?? (file.status === "modified" && file.previous !== void 0 && goSourceSemantics(file.current) !== goSourceSemantics(file.previous) && !previousSignatures.has(currentSignature) ? publisher.asyncStart : void 0);
           if (evidence === void 0) continue;
           signals.push({
             ruleId: "go-http.cancelled-response-publication",
@@ -21570,6 +21583,26 @@ function cancelledResponsePublicationSignals(file, root, previousRoot) {
     }
   }
   return signals;
+}
+function cancelledResponsePublicationSignature(signal) {
+  return [
+    signal.data.ownerType,
+    signal.data.responseField,
+    signal.data.completionField,
+    signal.data.producer,
+    signal.data.waiter,
+    signal.data.responseOwner
+  ].join("|");
+}
+function cancelledResponsePublicationSignatureParts(state, publisher, waiter, owner) {
+  return [
+    state.typeName,
+    state.responseField,
+    state.completionField,
+    publisher.methodName,
+    waiter.methodName,
+    owner.methodName
+  ].join("|");
 }
 function ownedResponseStates(root, source, httpAliases, contextAliases) {
   const states = [];
@@ -21719,7 +21752,7 @@ function cancellationWaiters(state, methods, lexicalSource, source) {
         (item) => communicationReceivesContextDone(item, lexicalSource, receiver, state.contextFields)
       );
       if (completionCase === void 0 || cancellationCase === void 0) continue;
-      const cancellationReturn = descendants(cancellationCase, "return_statement").filter((item) => sameSyntaxNode(owningFunction(item), method)).sort((left, right) => left.startIndex - right.startIndex)[0];
+      const cancellationReturn = descendants(cancellationCase, "return_statement").filter((item) => sameSyntaxNode(owningFunction(item), method) && reachableWithinBoundary(cancellationCase, item, lexicalSource)).sort((left, right) => left.startIndex - right.startIndex)[0];
       if (cancellationReturn === void 0) continue;
       waiters.push({
         method,
@@ -21733,6 +21766,30 @@ function cancellationWaiters(state, methods, lexicalSource, source) {
     }
   }
   return waiters;
+}
+function reachableWithinBoundary(boundary, node, source) {
+  let current = node;
+  while (current !== null && !sameSyntaxNode(current, boundary)) {
+    const parent = current.parent;
+    if (parent === null) return false;
+    if (parent.type === "if_statement") {
+      const value = booleanLiteral(parent.childForFieldName("condition"), source);
+      const consequence = parent.childForFieldName("consequence");
+      const alternative = parent.childForFieldName("alternative");
+      if (value === false && consequence !== null && containsNode(consequence, current)) return false;
+      if (value === true && alternative !== null && containsNode(alternative, current)) return false;
+    }
+    if (parent.type === "for_statement" && forConditionBoolean(parent, source) === false) return false;
+    if (parent.type === "expression_case" && !expressionCaseCanExecute(parent, source)) return false;
+    if (parent.type === "statement_list") {
+      const statements = parent.namedChildren;
+      const containing = statements.find((statement) => containsNode(statement, current));
+      if (containing === void 0) return false;
+      if (statements.some((statement) => statement.endIndex < containing.startIndex && unconditionallyTerminatesBefore(parent, statement, containing, source))) return false;
+    }
+    current = parent;
+  }
+  return current !== null;
 }
 function waitReceiveNode(caseNode) {
   return caseNode.namedChildren.find((child) => child.type === "receive_statement") ?? caseNode;
@@ -21752,7 +21809,7 @@ function cancellationCaseHandlesResponse(waiter, state, methods, lexicalSource, 
   const statements = waiter.cancellationCase.namedChildren.find((child) => child.type === "statement_list");
   if (statements === void 0) return false;
   const topLevel = directCaseStatements(waiter.cancellationCase);
-  const returnIndex = topLevel.findIndex((statement) => sameSyntaxNode(statement, waiter.cancellationReturn));
+  const returnIndex = topLevel.findIndex((statement) => containsNode(statement, waiter.cancellationReturn));
   if (returnIndex < 0) return false;
   return topLevel.slice(0, returnIndex).some((statement, index) => {
     if (!priorStatementsCannotBypass(topLevel.slice(0, index), waiter.method, lexicalSource)) return false;
@@ -21786,6 +21843,7 @@ function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) 
   const assignedName = assigned?.type === "identifier" ? sourceText(assigned, source) : void 0;
   const directlyClosed = descendants(body2, "call_expression").some((call) => {
     if (!sameSyntaxNode(owningFunction(call), publisher.method) || call.startIndex <= publisher.assignment.endIndex || !directlyReachableInBlock(body2, call, lexicalSource)) return false;
+    if (!producerCleanupPrecedesSignal(call, publisher)) return false;
     if (!sameSyntaxNode(enclosingBlock(call), enclosingBlock(publisher.assignment))) return false;
     const path = callPath(call, lexicalSource);
     return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) || assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]);
@@ -21793,6 +21851,7 @@ function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) 
   if (directlyClosed) return true;
   return descendants(body2, "call_expression").some((invocation) => {
     if (!sameSyntaxNode(owningFunction(invocation), publisher.method) || invocation.startIndex <= publisher.assignment.endIndex || !directlyReachableInBlock(body2, invocation, lexicalSource)) return false;
+    if (publisher.signal.type !== "defer_statement" && invocation.endIndex >= publisher.signal.startIndex) return false;
     if (directStatementContaining(body2, invocation)?.type !== "expression_statement") return false;
     const literal = invocation.childForFieldName("function");
     if (literal?.type !== "func_literal" || callArguments(invocation).length !== 0) return false;
@@ -21804,6 +21863,13 @@ function producerOwnsPublishedResponse(publisher, state, lexicalSource, source) 
       return pathEquals(path, [publisher.receiver, state.responseField, "Body", "Close"]) || assignedName !== void 0 && pathEquals(path, [assignedName, "Body", "Close"]);
     });
   });
+}
+function producerCleanupPrecedesSignal(cleanup, publisher) {
+  const deferredCleanup = nearestAncestorOfTypes(cleanup, /* @__PURE__ */ new Set(["defer_statement"]));
+  if (publisher.signal.type !== "defer_statement") {
+    return deferredCleanup === null && cleanup.endIndex < publisher.signal.startIndex;
+  }
+  return deferredCleanup === null || deferredCleanup.startIndex > publisher.signal.startIndex;
 }
 function responseOwners(state, waiter, methods, lexicalSource, source, bodyConsumerPaths) {
   const owners = [];
@@ -21906,11 +21972,11 @@ function responseWaitWrappers(state, waiter, methods, lexicalSource, source) {
     const waitCall = descendants(body2, "call_expression").find(
       (call) => sameSyntaxNode(owningFunction(call), method) && directlyReachableInBlock(body2, call, lexicalSource) && pathEquals(callPath(call, lexicalSource), [receiver, waiter.methodName])
     );
-    if (waitCall === void 0) continue;
+    if (waitCall === void 0 || !receiverBindingPreserved(method, receiver, waitCall, source)) continue;
     const responseReturn = descendants(body2, "return_statement").find(
       (statement) => sameSyntaxNode(owningFunction(statement), method) && directlyReachableInBlock(body2, statement, lexicalSource) && statement.startIndex > waitCall.endIndex && statement.namedChildren.some((child) => pathEquals(selectorPath(child, lexicalSource), [receiver, state.responseField]))
     );
-    if (responseReturn === void 0 || hasUnconditionalTerminationBetween(body2, waitCall, responseReturn, lexicalSource)) continue;
+    if (responseReturn === void 0 || !bindingPathPreserved(method, receiver, responseReturn, source, waitCall.endIndex) || hasUnconditionalTerminationBetween(body2, waitCall, responseReturn, lexicalSource)) continue;
     if (callerReobservesCompletion(
       body2,
       waitCall,
@@ -21950,14 +22016,16 @@ function allPathsReachStatement(body2, target, source) {
   );
 }
 function priorStatementsCannotBypass(statements, owner, source) {
+  const ownerBody = owner.childForFieldName("body");
+  if (ownerBody === null) return false;
   return !statements.some((statement) => {
     return [
       ...descendants(statement, "return_statement"),
       ...descendants(statement, "goto_statement"),
       ...descendants(statement, "break_statement"),
       ...descendants(statement, "continue_statement")
-    ].some((candidate) => sameSyntaxNode(owningFunction(candidate), owner)) || descendants(statement, "call_expression").some(
-      (call) => sameSyntaxNode(owningFunction(call), owner) && pathEquals(callPath(call, source), ["panic"]) && unshadowedBuiltin(call, "panic", source)
+    ].some((candidate) => sameSyntaxNode(owningFunction(candidate), owner) && reachableWithinBoundary(ownerBody, candidate, source)) || descendants(statement, "call_expression").some(
+      (call) => sameSyntaxNode(owningFunction(call), owner) && reachableWithinBoundary(ownerBody, call, source) && pathEquals(callPath(call, source), ["panic"]) && unshadowedBuiltin(call, "panic", source)
     );
   });
 }
@@ -22236,7 +22304,7 @@ function nestedBlockCanExecute(block, source) {
     if (alternative !== null && containsNode(alternative, block) && condition === true) return false;
   }
   if (controller?.type === "for_statement") {
-    if (booleanLiteral(controller.childForFieldName("condition"), source) === false) return false;
+    if (forConditionBoolean(controller, source) === false) return false;
   }
   return true;
 }
@@ -22245,6 +22313,22 @@ function booleanLiteral(node, source) {
   if (expression?.type === "true") return true;
   if (expression?.type === "false") return false;
   return void 0;
+}
+function forConditionBoolean(loop, source) {
+  const direct = booleanLiteral(loop.childForFieldName("condition"), source);
+  if (direct !== void 0) return direct;
+  const body2 = loop.childForFieldName("body");
+  if (body2 === null) return void 0;
+  const header = source.slice(loop.startIndex, body2.startIndex).replace(/[\s()]/g, "");
+  if (header === "forfalse") return false;
+  if (header === "fortrue") return true;
+  return void 0;
+}
+function unconditionalForLoop(loop, source) {
+  const body2 = loop.childForFieldName("body");
+  if (body2 === null) return false;
+  const header = source.slice(loop.startIndex, body2.startIndex).replace(/[\s()]/g, "");
+  return header === "for" || header === "for;;" || forConditionBoolean(loop, source) === true;
 }
 function unconditionallyTerminatesBefore(block, candidate, target, source) {
   if (candidate.type === "labeled_statement") {
@@ -22284,7 +22368,7 @@ function unconditionallyTerminatesBefore(block, candidate, target, source) {
     ].filter(
       (caseNode) => nearestAncestorOfTypes(caseNode, /* @__PURE__ */ new Set(["expression_switch_statement", "type_switch_statement"]))?.id === candidate.id
     );
-    return cases.length > 0 && cases.some((caseNode) => isDefaultCase(caseNode, source)) && cases.every((caseNode) => caseUnconditionallyTerminates(block, caseNode, target, source));
+    return cases.length > 0 && cases.some((caseNode) => isDefaultCase(caseNode, source)) && cases.every((caseNode, index) => switchCaseUnconditionallyTerminates(block, cases, index, target, source));
   }
   if (candidate.type === "select_statement") {
     const cases = [
@@ -22293,11 +22377,43 @@ function unconditionallyTerminatesBefore(block, candidate, target, source) {
     ].filter(
       (caseNode) => nearestAncestorOfTypes(caseNode, /* @__PURE__ */ new Set(["select_statement"]))?.id === candidate.id
     );
-    return cases.length > 0 && cases.some((caseNode) => isDefaultCase(caseNode, source)) && cases.every((caseNode) => caseUnconditionallyTerminates(block, caseNode, target, source));
+    return cases.length === 0 || cases.every((caseNode) => caseUnconditionallyTerminates(block, caseNode, target, source));
+  }
+  if (candidate.type === "for_statement") {
+    if (!unconditionalForLoop(candidate, source)) return false;
+    return !loopCanExit(candidate, source);
   }
   if (candidate.type !== "expression_statement") return false;
   const expression = unwrapExpression(candidate.namedChildren[0]);
   return expression?.type === "call_expression" && pathEquals(callPath(expression, source), ["panic"]) && unshadowedBuiltin(expression, "panic", source);
+}
+function switchCaseUnconditionallyTerminates(block, cases, index, target, source) {
+  const current = cases[index];
+  if (current === void 0) return false;
+  if (caseUnconditionallyTerminates(block, current, target, source)) return true;
+  const statements = current.namedChildren.find((child) => child.type === "statement_list")?.namedChildren ?? [];
+  const last = statements.at(-1);
+  return last?.type === "fallthrough_statement" && switchCaseUnconditionallyTerminates(block, cases, index + 1, target, source);
+}
+function loopCanExit(loop, source) {
+  const body2 = loop.childForFieldName("body");
+  if (body2 === null) return true;
+  return [
+    ...descendants(loop, "break_statement"),
+    ...descendants(loop, "goto_statement")
+  ].some((candidate) => {
+    if (!sameSyntaxNode(owningFunction(candidate), owningFunction(loop))) return false;
+    if (candidate.type === "goto_statement") return directlyReachableInBlock(body2, candidate, source);
+    return nearestBreakableAncestor(candidate)?.id === loop.id && directlyReachableInBlock(body2, candidate, source);
+  });
+}
+function nearestBreakableAncestor(node) {
+  let current = node.parent;
+  while (current !== null) {
+    if (["for_statement", "expression_switch_statement", "type_switch_statement", "select_statement"].includes(current.type)) return current;
+    current = current.parent;
+  }
+  return null;
 }
 function branchUnconditionallyTerminates(block, branch, target, source) {
   if (branch.type === "else_clause") {

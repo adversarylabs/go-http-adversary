@@ -205,9 +205,13 @@ test("requires reachable producer signalling and body ownership", async () => {
     vulnerable.replace("defer close(d.responseReady)", "if false { defer close(d.responseReady) }"),
     vulnerable.replace("_ = d.BlockUntilResponseReady()", "_ = d.BlockUntilResponseReady()\n  return nil"),
   ];
-  for (const source of variants) {
+  for (const [index, source] of variants.entries()) {
     const result = await repository(source);
-    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+    assert.equal(
+      result.signals.some((item) => item.ruleId === ruleId),
+      false,
+      `variant ${index}: ${JSON.stringify(result.signals, null, 2)}`,
+    );
   }
 });
 
@@ -902,6 +906,129 @@ test("treats only exhaustive terminating control flow as making later ownership 
   for (const source of reachable) {
     assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
   }
+});
+
+test("selects only reachable cancellation returns and honors a dominating completion wait", async () => {
+  const variants = [
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    if false { return d.ctx.Err() }\n    <-d.responseReady\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    <-d.responseReady\n    if retry() { return d.ctx.Err() }\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    switch false { case true: return d.ctx.Err() }\n    <-d.responseReady\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    for false { return d.ctx.Err() }\n    <-d.responseReady\n    return d.ctx.Err()",
+    ),
+  ];
+  for (const [index, source] of variants.entries()) {
+    const result = await repository(source);
+    assert.equal(
+      result.signals.some((item) => item.ruleId === ruleId),
+      false,
+      `cancellation variant ${index}: ${JSON.stringify(result.signals, null, 2)}`,
+    );
+  }
+});
+
+test("requires producer cleanup before signalling and preserves wrapper receiver identity", async () => {
+  const cleanupAfterSignal = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace("  d.response = response", "  d.response = response\n  close(d.responseReady)\n  _ = d.response.Body.Close()");
+  const iifeCleanupAfterSignal = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  close(d.responseReady)\n  func() { _ = d.response.Body.Close() }()",
+    );
+  for (const source of [cleanupAfterSignal, iifeCleanupAfterSignal]) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const unsafeDeferOrder = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  defer d.response.Body.Close()\n  defer close(d.responseReady)",
+    );
+  assert.ok((await repository(unsafeDeferOrder)).signals.some((item) => item.ruleId === ruleId));
+
+  const safeDeferOrder = vulnerable
+    .replace("  defer close(d.responseReady)\n", "")
+    .replace(
+      "  d.response = response",
+      "  d.response = response\n  defer close(d.responseReady)\n  defer d.response.Body.Close()",
+    );
+  assert.equal((await repository(safeDeferOrder)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const reassignedWrapper = vulnerable
+    .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      `func (d *duplexHTTPCall) CloseRead() error {
+  _ = d.BlockUntilResponseReady()
+  if d.response == nil { return nil }
+  return d.response.Body.Close()
+}`,
+      `func (d *duplexHTTPCall) responseAfterWait() *http.Response {
+  _ = d.BlockUntilResponseReady()
+  d = other
+  return d.response
+}
+func (d *duplexHTTPCall) CloseRead() error {
+  response := d.responseAfterWait()
+  return response.Body.Close()
+}`,
+    );
+  assert.equal((await repository(reassignedWrapper)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("handles select, fallthrough, infinite-loop, and deletion-only relationship reachability", async () => {
+  const unreachableOwners = [
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  select { case <-d.responseReady: return nil; case <-d.ctx.Done(): return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  switch mode() { case 1: fallthrough; default: return nil }\n  if d.response == nil",
+    ),
+    vulnerable.replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil",
+      "_ = d.BlockUntilResponseReady()\n  for {}\n  if d.response == nil",
+    ),
+  ];
+  for (const source of unreachableOwners) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const prefix = "var other *duplexHTTPCall\n\n";
+  const previous = (prefix + vulnerable).replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { d = other; go d.makeRequest() }",
+  );
+  const current = previous.replace("d = other; ", "");
+  const deletionOnly = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{ path: "duplex_http_call.go", current, previous, status: "modified", changedLines: new Set() }],
+  });
+  assert.ok(deletionOnly.signals.some((item) => item.ruleId === ruleId));
+
+  const line = lineOf(current, "func (d *duplexHTTPCall) start");
+  const adjacent = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{ path: "duplex_http_call.go", current, previous, status: "modified", changedLines: new Set([line]) }],
+  });
+  const signal = adjacent.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
 });
 
 test("a reset after direct completion signalling does not erase the publication race", async () => {
