@@ -22446,10 +22446,18 @@ function definiteClosureInvocation(literal, relationship, owner, use, source) {
       binding,
       path[0],
       call,
-      literal,
       source
     )) continue;
     const execution = synchronousCallExecution(owner, call, use, path[0], source);
+    if (execution !== null) return execution;
+  }
+  for (const call of descendants(owner, "call_expression")) {
+    if (call.startIndex <= binding.node.endIndex || call.endIndex >= use.startIndex || !pathEquals(callPath(call, source)?.slice(-1), ["Do"]) || !synchronousInvocation(call)) continue;
+    const callback = unwrapExpression(callArguments(call)[0]);
+    if (callback?.type !== "identifier") continue;
+    const callbackName = sourceText(callback, source).trim();
+    if (!closureNameMayReferenceLiteral(owner, binding, callbackName, call, source) || !standardOnceReceiver(call, owner, source)) continue;
+    const execution = synchronousCallExecution(owner, call, use, callbackName, source);
     if (execution !== null) return execution;
   }
   return null;
@@ -22474,7 +22482,7 @@ function closureLiteralBinding(literal, source) {
   const scope = enclosingBlock(binding);
   return /^[A-Za-z_]\w*$/.test(name2) && scope !== null ? { name: name2, node: binding, scope } : void 0;
 }
-function closureNameMayReferenceLiteral(owner, origin, calledName, call, literal, source) {
+function closureNameMayReferenceLiteral(owner, origin, calledName, call, source) {
   const lineage = /* @__PURE__ */ new Map([[origin.name, true]]);
   const bindings = [
     ...descendants(owner, "short_var_declaration"),
@@ -22485,23 +22493,23 @@ function closureNameMayReferenceLiteral(owner, origin, calledName, call, literal
   ).sort((left, right) => left.startIndex - right.startIndex);
   for (const candidate of bindings) {
     if (sameSyntaxNode(candidate, origin.node)) continue;
-    const sides = assignmentSides(candidate);
-    const left = unwrapExpression(sides?.left);
-    const right = unwrapExpression(sides?.right);
-    if (left?.type !== "identifier" || right === void 0) continue;
-    const name2 = sourceText(left, source).trim();
-    const rightName = right.type === "identifier" ? sourceText(right, source).trim() : void 0;
-    const derivesFromOrigin = rightName !== void 0 && lineage.get(rightName) === true;
-    if (candidate.type === "short_var_declaration" || candidate.type === "var_spec") {
-      const scope = enclosingBlock(candidate);
-      if (scope !== null && containsNode(scope, call)) lineage.set(name2, derivesFromOrigin);
-      continue;
-    }
-    if (!lineage.has(name2)) continue;
-    if (derivesFromOrigin) {
-      lineage.set(name2, true);
-    } else if (assignmentDefinitelyExecutesBeforeCall(owner, candidate, call, source)) {
-      lineage.set(name2, false);
+    const pairs = simpleBindingPairs(candidate, source);
+    const updates = pairs.map(({ name: name2, right }) => ({
+      name: name2,
+      derivesFromOrigin: right.type === "identifier" && lineage.get(sourceText(right, source).trim()) === true
+    }));
+    for (const { name: name2, derivesFromOrigin } of updates) {
+      if (candidate.type === "short_var_declaration" || candidate.type === "var_spec") {
+        const scope = enclosingBlock(candidate);
+        if (scope !== null && containsNode(scope, call)) lineage.set(name2, derivesFromOrigin);
+        continue;
+      }
+      if (!lineage.has(name2)) continue;
+      if (derivesFromOrigin) {
+        lineage.set(name2, true);
+      } else if (assignmentDefinitelyExecutesBeforeCall(owner, candidate, call, source)) {
+        lineage.set(name2, false);
+      }
     }
   }
   if (lineage.get(calledName) !== true) return false;
@@ -22510,7 +22518,48 @@ function closureNameMayReferenceLiteral(owner, origin, calledName, call, literal
     if (lexicalOwner.type !== "func_literal" || !localNameUnshadowedAtUse(lexicalOwner, calledName, call, source)) return false;
     lexicalOwner = owningFunction(lexicalOwner);
   }
-  return lexicalOwner !== null && !sameSyntaxNode(literal, call);
+  return lexicalOwner !== null;
+}
+function simpleBindingPairs(node, source) {
+  const sides = assignmentSides(node);
+  if (sides === void 0) return [];
+  const left = sides.left.type === "expression_list" ? sides.left.namedChildren : [unwrapExpression(sides.left)];
+  const right = sides.right.type === "expression_list" ? sides.right.namedChildren : [unwrapExpression(sides.right)];
+  if (left.length !== right.length) return [];
+  return left.flatMap((candidate, index) => {
+    const value = right[index];
+    return candidate?.type === "identifier" && value !== void 0 ? [{ name: sourceText(candidate, source).trim(), right: value }] : [];
+  });
+}
+function standardOnceReceiver(call, owner, source) {
+  const path = callPath(call, source);
+  if (path?.length !== 2 || path[1] !== "Do") return false;
+  const receiver = path[0];
+  let root = owner;
+  while (root.parent !== null) root = root.parent;
+  const aliases = standardImportAliases(root, source, "sync", "sync");
+  if (aliases.size === 0 || ![...aliases].some((alias) => localNameUnshadowedAtUse(owner, alias, call, source))) {
+    return false;
+  }
+  const declarations = [
+    ...descendants(root, "var_spec"),
+    ...descendants(root, "short_var_declaration")
+  ].filter((declaration2) => {
+    if (declaration2.startIndex >= call.startIndex || !declarationNames(declaration2, source).has(receiver)) return false;
+    const declarationOwner = owningFunction(declaration2);
+    if (declarationOwner === null) return true;
+    const scope = enclosingBlock(declaration2);
+    return sameSyntaxNode(declarationOwner, owner) && scope !== null && containsNode(scope, call);
+  }).sort((left, right) => right.startIndex - left.startIndex);
+  const declaration = declarations[0];
+  if (declaration === void 0 || ![...aliases].some(
+    (alias) => new RegExp(`\\b${escapeRegExp(receiver)}\\b[\\s:=]*${escapeRegExp(alias)}\\.Once\\b`).test(
+      sourceText(declaration, source).replace(/\s+/g, " ")
+    )
+  )) return false;
+  return !descendants(owner, "assignment_statement").some(
+    (assignment) => assignment.startIndex > declaration.endIndex && assignment.endIndex < call.startIndex && directlyAssignsIdentifier(assignmentSides(assignment)?.left ?? assignment, receiver, source) && assignmentDefinitelyExecutesBeforeCall(owner, assignment, call, source)
+  );
 }
 function assignmentDefinitelyExecutesBeforeCall(owner, assignment, call, source) {
   const ownerBody = owner.childForFieldName("body");
@@ -22526,7 +22575,7 @@ function synchronousCallExecution(owner, call, use, calledName, source) {
   while (lexicalOwner !== null && !sameSyntaxNode(lexicalOwner, owner)) {
     if (lexicalOwner.type !== "func_literal" || !localNameUnshadowedAtUse(lexicalOwner, calledName, call, source)) return null;
     const body2 = lexicalOwner.childForFieldName("body");
-    const invocation = directInvocationOfLiteral(lexicalOwner);
+    const invocation = directInvocationOfLiteral(lexicalOwner) ?? definiteClosureInvocation(lexicalOwner, execution, owner, use, source);
     if (body2 === null || invocation === null || !synchronousInvocation(invocation) || !directlyReachableInBlock(body2, execution, source)) return null;
     execution = invocation;
     lexicalOwner = owningFunction(lexicalOwner);
@@ -22633,6 +22682,33 @@ function responseOwnerActivationStatements(owner, source) {
     const binding = closureLiteralBinding(literal, source);
     return binding === void 0 ? [] : [binding.name];
   }));
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const statement of [
+      ...descendants(owner.method, "short_var_declaration"),
+      ...descendants(owner.method, "var_spec"),
+      ...descendants(owner.method, "assignment_statement")
+    ].filter((candidate) => candidate.endIndex < owner.waitCall.startIndex)) {
+      for (const pair of simpleBindingPairs(statement, source)) {
+        if (pair.right.type === "identifier" && closureNames.has(sourceText(pair.right, source).trim()) && !closureNames.has(pair.name)) {
+          closureNames.add(pair.name);
+          expanded = true;
+        }
+      }
+    }
+    for (const literal of descendants(owner.method, "func_literal")) {
+      if (literal.endIndex >= owner.waitCall.startIndex || !descendants(literal, "call_expression").some((call) => {
+        const path = callPath(call, source);
+        return path?.length === 1 && closureNames.has(path[0]);
+      })) continue;
+      const binding = closureLiteralBinding(literal, source);
+      if (binding !== void 0 && !closureNames.has(binding.name)) {
+        closureNames.add(binding.name);
+        expanded = true;
+      }
+    }
+  }
   const closureStatements = [
     ...descendants(owner.method, "short_var_declaration"),
     ...descendants(owner.method, "var_spec"),

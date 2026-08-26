@@ -1449,6 +1449,84 @@ test("tracks captured receiver mutation through executed closure value lineage",
   assert.equal(signal.line, line);
 });
 
+test("tracks receiver mutation through bounded synchronous wrappers and sync.Once callbacks", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const mutation = "func() { select { case d = <-calls: default: } }";
+  const executed = [
+    `mutate := ${mutation}; invoke := func() { mutate() }; invoke()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; alias := invoke; alias()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; first, second := invoke, func() {}; _ = second; first()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; (invoke)()`,
+    `mutate := ${mutation}; invoke := func() { if enabled() { mutate() } }; invoke()`,
+  ];
+  for (const [index, statements] of executed.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.equal(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      false,
+      `wrapper variant ${index}`,
+    );
+  }
+
+  const once = (prefix + vulnerable)
+    .replace('  "net/http"\n)', '  "net/http"\n  "sync"\n)\nvar once sync.Once')
+    .replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  mutate := ${mutation}; once.Do(mutate)\n  _ = d.BlockUntilResponseReady()`,
+    );
+  assert.equal((await repository(once)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const nonExecutions = [
+    `mutate := ${mutation}; invoke := func() { mutate() }; _ = invoke`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; if false { invoke() }`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; go invoke()`,
+    `mutate := ${mutation}; invoke := func() { mutate() }; defer invoke()`,
+    `mutate := ${mutation}; fake := struct{ Do func(func()) }{}; fake.Do(mutate)`,
+  ];
+  for (const [index, statements] of nonExecutions.entries()) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${statements}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok(
+      (await repository(source)).signals.some((item) => item.ruleId === ruleId),
+      `non-executing wrapper ${index}`,
+    );
+  }
+
+  const shadowedSync = (prefix + vulnerable)
+    .replace('  "net/http"\n)', '  "net/http"\n  "sync"\n)\nvar once sync.Once')
+    .replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  mutate := ${mutation}; sync := struct{ Once int }{}; _ = sync; once.Do(mutate)\n  _ = d.BlockUntilResponseReady()`,
+    );
+  assert.ok((await repository(shadowedSync)).signals.some((item) => item.ruleId === ruleId));
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    `  mutate := ${mutation}; invoke := func() { mutate() }; alias := invoke; alias()\n  _ = d.BlockUntilResponseReady()`,
+  );
+  const current = previous.replace("alias()", "_ = alias");
+  const line = lineOf(current, "_ = alias");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
 test("harmless work around a waiter error guard does not make late cancellation safe", async () => {
   const variants = [
     "waitErr := d.BlockUntilResponseReady()\n  observe()\n  if waitErr != nil { return waitErr }",
