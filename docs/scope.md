@@ -14,6 +14,7 @@ Review Go HTTP servers/clients for bounded requests, safe middleware, and produc
 
 - Missing timeouts, unbounded request/client bodies, and unbounded buffering of provider or downstream HTTP response output
 - HTTP response-body ownership lost when cancellation races a concurrent response publication
+- Client response metadata that is duplicated or moved between classified header/trailer channels
 - Middleware ordering / panic recovery gaps
 - Server shutdown / lifecycle mistakes
 - Unsafe client reuse or per-request clients in hot paths when relevant to HTTP

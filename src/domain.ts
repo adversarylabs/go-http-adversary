@@ -76,6 +76,22 @@ export const domain: DomainDefinition = {
         "After checking the request error, defer response.Body.Close before consuming the body; if the response is returned, make that ownership transfer explicit.",
     },
     {
+      id: "go-http.aggregate-error-metadata-as-trailers",
+      title: "Aggregate error metadata is reclassified as response trailers",
+      concern: "unclassified aggregate error metadata merged into classified response trailers",
+      category: "correctness",
+      severity: "medium",
+      confidence: "medium",
+      summary: (count) =>
+        `${count} response metadata wrapper${count === 1 ? " merges" : "s merge"} aggregate error metadata into a retained trailer channel.`,
+      whyItMatters:
+        "Aggregate error metadata can contain both response headers and trailers; copying it into trailers loses channel identity and can duplicate values already exposed by the underlying response.",
+      impact:
+        "Clients can observe response headers as trailers or receive duplicated metadata, producing protocol-dependent behavior and misleading CallInfo-style APIs.",
+      recommendation:
+        "Preserve the underlying classified header and trailer channels. Expose aggregate error metadata only through its aggregate API, or partition it with a proven protocol marker before assigning it to a channel.",
+    },
+    {
       id: "go-http.cancelled-response-publication",
       title: "Cancellation can abandon a concurrently published HTTP response",
       concern: "HTTP responses abandoned by a cancellation/completion race",

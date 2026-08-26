@@ -22,6 +22,7 @@ test("the published runtime executes without node_modules", async () => {
     .map((line) => line.trim())
     .filter(Boolean);
   assert.ok(ignored.includes(".git"));
+  assert.ok(ignored.includes("node_modules/"));
 
   await mkdir(dirname(entrypoint), { recursive: true });
   await mkdir(join(artifact, "schemas"), { recursive: true });
@@ -60,6 +61,23 @@ func (c *call) closeResponse() error {
   if c.response == nil { return nil }
   return c.response.Body.Close()
 }
+
+type responseSource interface {
+  ResponseHeader() http.Header
+  ResponseTrailer() http.Header
+}
+type Error struct{}
+func (e *Error) Meta() http.Header { return make(http.Header) }
+type errorResponseWrapper struct {
+  base responseSource
+  err *Error
+}
+func (w *errorResponseWrapper) ResponseTrailer() http.Header {
+  combined := make(http.Header)
+  for k, v := range w.base.ResponseTrailer() { combined[k] = v }
+  for k, v := range w.err.Meta() { combined[k] = v }
+  return combined
+}
 `);
   await writeFile(input, `${JSON.stringify({ source: { path: repository } })}\n`);
 
@@ -93,10 +111,17 @@ func (c *call) closeResponse() error {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-http");
-  assert.equal(envelope.result.adversary.version, "0.0.20");
+  assert.equal(envelope.result.adversary.version, "0.0.21");
   assert.equal(
     envelope.result.findings.some((finding: { ruleId?: string }) =>
       finding.ruleId === "go-http.cancelled-response-publication"
+    ),
+    true,
+    JSON.stringify(envelope.result.findings, null, 2),
+  );
+  assert.equal(
+    envelope.result.findings.some((finding: { ruleId?: string }) =>
+      finding.ruleId === "go-http.aggregate-error-metadata-as-trailers"
     ),
     true,
     JSON.stringify(envelope.result.findings, null, 2),
