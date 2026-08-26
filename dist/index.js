@@ -21900,20 +21900,18 @@ function allPathsPerformInSequence(statements, action, source) {
   if (statement.type === "expression_switch_statement") {
     const cases = directControlCases(statement, "expression_case");
     if (cases.length === 0 || !cases.some((candidate) => isDefaultCase(candidate, source))) return false;
-    return cases.every((candidate) => allPathsPerformInSequence(
-      [...caseStatements(candidate), ...rest],
-      action,
-      source
-    ));
+    return cases.every((_, index) => {
+      const path = switchCasePath(cases, index, rest, source);
+      return path !== void 0 && allPathsPerformInSequence(path, action, source);
+    });
   }
   if (statement.type === "select_statement") {
     const cases = directControlCases(statement, "communication_case");
     if (cases.length === 0) return false;
-    return cases.every((candidate) => allPathsPerformInSequence(
-      [candidate, ...caseStatements(candidate), ...rest],
-      action,
-      source
-    ));
+    return cases.every((candidate) => {
+      const path = selectCasePath(candidate, rest, source);
+      return path !== void 0 && allPathsPerformInSequence(path, action, source);
+    });
   }
   if (["return_statement", "goto_statement", "break_statement", "continue_statement", "fallthrough_statement"].includes(statement.type)) return false;
   if (["type_switch_statement", "for_statement"].includes(statement.type)) return false;
@@ -21927,10 +21925,33 @@ function directControlCases(control, type) {
   return [...descendants(control, type), ...descendants(control, "default_case")].filter((candidate) => {
     const boundaryType = type === "expression_case" ? "expression_switch_statement" : "select_statement";
     return sameSyntaxNode(nearestAncestorOfTypes(candidate, /* @__PURE__ */ new Set([boundaryType])), control);
-  });
+  }).sort((left, right) => left.startIndex - right.startIndex);
 }
 function caseStatements(caseNode) {
   return caseNode.namedChildren.find((child) => child.type === "statement_list")?.namedChildren ?? [];
+}
+function switchCasePath(cases, index, continuation, source) {
+  const statements = caseStatements(cases[index]);
+  const transferIndex = statements.findIndex(
+    (statement) => statement.type === "break_statement" || statement.type === "fallthrough_statement"
+  );
+  if (transferIndex < 0) return [...statements, ...continuation];
+  const transfer = statements[transferIndex];
+  const prefix = statements.slice(0, transferIndex);
+  if (transfer.type === "break_statement") {
+    return sourceText(transfer, source).trim() === "break" ? [...prefix, ...continuation] : void 0;
+  }
+  if (transferIndex !== statements.length - 1 || index + 1 >= cases.length) return void 0;
+  const following = switchCasePath(cases, index + 1, continuation, source);
+  return following === void 0 ? void 0 : [...prefix, ...following];
+}
+function selectCasePath(caseNode, continuation, source) {
+  const statements = caseStatements(caseNode);
+  const breakIndex = statements.findIndex((statement) => statement.type === "break_statement");
+  if (breakIndex < 0) return [caseNode, ...statements, ...continuation];
+  const transfer = statements[breakIndex];
+  if (sourceText(transfer, source).trim() !== "break") return void 0;
+  return [caseNode, ...statements.slice(0, breakIndex), ...continuation];
 }
 function controlledStatements(node) {
   if (node === null) return [];
@@ -22103,7 +22124,10 @@ function responseBodyUseCloses(bodyUse, source) {
 function waitCallHasTerminatingErrorGuard(waitCall, bodyUse, source) {
   let current = waitCall.parent;
   while (current !== null && current.type !== "if_statement") {
-    if (current.type === "statement_list" || current.type === "block") return false;
+    if (current.type === "statement_list" || current.type === "block") {
+      current = null;
+      break;
+    }
     current = current.parent;
   }
   if (current !== null) {
@@ -22122,7 +22146,7 @@ function waitCallHasTerminatingErrorGuard(waitCall, bodyUse, source) {
   const useStatement = topLevelStatementContaining(body2, bodyUse);
   if (waitStatement === void 0 || useStatement === void 0) return false;
   return topLevelStatements(body2).some(
-    (statement) => statement.type === "if_statement" && statement.startIndex > waitStatement.endIndex && statement.endIndex < useStatement.startIndex && errorGuardReturns(statement, errorName, source)
+    (statement) => statement.type === "if_statement" && statement.startIndex > waitStatement.endIndex && statement.endIndex < useStatement.startIndex && errorGuardReturns(statement, errorName, source) && bindingPathPreserved(owner, errorName, statement, source, waitCall.endIndex)
   );
 }
 function errorGuardReturns(guard, errorName, source) {
@@ -22192,12 +22216,22 @@ function priorStatementsCannotBypass(statements, owner, source) {
     return [
       ...descendants(statement, "return_statement"),
       ...descendants(statement, "goto_statement"),
-      ...descendants(statement, "break_statement"),
       ...descendants(statement, "continue_statement")
-    ].some((candidate) => sameSyntaxNode(owningFunction(candidate), owner) && reachableWithinBoundary(ownerBody, candidate, source)) || descendants(statement, "call_expression").some(
+    ].some((candidate) => sameSyntaxNode(owningFunction(candidate), owner) && reachableWithinBoundary(ownerBody, candidate, source)) || descendants(statement, "break_statement").some(
+      (candidate) => sameSyntaxNode(owningFunction(candidate), owner) && reachableWithinBoundary(ownerBody, candidate, source) && breakEscapesStatement(candidate, statement, source)
+    ) || descendants(statement, "call_expression").some(
       (call) => sameSyntaxNode(owningFunction(call), owner) && reachableWithinBoundary(ownerBody, call, source) && pathEquals(callPath(call, source), ["panic"]) && unshadowedBuiltin(call, "panic", source)
     );
   });
+}
+function breakEscapesStatement(breakStatement, statement, source) {
+  if (sourceText(breakStatement, source).trim() !== "break") return true;
+  const target = nearestAncestorOfTypes(breakStatement, /* @__PURE__ */ new Set([
+    "expression_switch_statement",
+    "type_switch_statement",
+    "select_statement"
+  ]));
+  return target === null || !containsNode(statement, target);
 }
 function canCompleteNormallyAfter(body2, node, source) {
   const containing = directStatementContaining(body2, node);

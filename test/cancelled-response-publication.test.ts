@@ -1129,6 +1129,54 @@ test("accepts only exhaustive switch and select cancellation synchronization", a
   assert.ok((await repository(partialBlockingSelect)).signals.some((item) => item.ruleId === ruleId));
 });
 
+test("follows switch fallthrough and break transfers to a common completion wait", async () => {
+  const fallthroughSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch mode() {
+    case 1:
+      fallthrough
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  const breakingSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch mode() {
+    case 1:
+      break
+    default:
+      break
+    }
+    <-d.responseReady
+    return d.ctx.Err()`,
+  );
+  const breakingSelect = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    select {
+    case <-otherReady():
+      break
+    default:
+      break
+    }
+    <-d.responseReady
+    return d.ctx.Err()`,
+  );
+  for (const source of [fallthroughSwitch, breakingSwitch, breakingSelect]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const unsynchronizedFallthrough = fallthroughSwitch.replace("      <-d.responseReady", "      observeOnly()");
+  assert.ok((await repository(unsynchronizedFallthrough)).signals.some((item) => item.ruleId === ruleId));
+  const bypassingSwitch = breakingSwitch.replace("case 1:\n      break", "case 1:\n      return d.ctx.Err()");
+  assert.ok((await repository(bypassingSwitch)).signals.some((item) => item.ruleId === ruleId));
+  const bypassingSelect = breakingSelect.replace("case <-otherReady():\n      break", "case <-otherReady():\n      return d.ctx.Err()");
+  assert.ok((await repository(bypassingSelect)).signals.some((item) => item.ruleId === ruleId));
+});
+
 test("handles select, fallthrough, infinite-loop, and deletion-only relationship reachability", async () => {
   const unreachableOwners = [
     vulnerable.replace(
