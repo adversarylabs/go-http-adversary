@@ -253,6 +253,76 @@ test("recognizes reachable nested producer starts without reviving statically de
   }
 });
 
+test("requires executable producer calls and accepts bounded cancellation synchronization", async () => {
+  const inertNestedClosure = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { go func() { _ = func() { d.makeRequest() } }() }",
+  );
+  assert.equal((await repository(inertNestedClosure)).signals.some((item) => item.ruleId === ruleId), false);
+  const deadInvokedProducer = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { go func() { if false { d.makeRequest() } }() }",
+  );
+  assert.equal((await repository(deadInvokedProducer)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const invokedProducerClosures = [
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { go func() { d.makeRequest() }() }",
+    ),
+    vulnerable.replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { go func() { func() { d.makeRequest() }() }() }",
+    ),
+  ];
+  for (const source of invokedProducerClosures) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const cancellationIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { <-d.responseReady }()\n    return d.ctx.Err()",
+  );
+  const cancellationHelper = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    d.awaitLate()\n    return d.ctx.Err()",
+    );
+  for (const source of [cancellationIIFE, cancellationHelper]) {
+    assert.equal((await repository(source)).signals.some((item) => item.ruleId === ruleId), false);
+  }
+
+  const conditionalHelper = cancellationHelper.replace(
+    "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }",
+    "func (d *duplexHTTPCall) awaitLate() { if shouldWait() { <-d.responseReady } }",
+  );
+  const competingIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { select { case <-d.responseReady: case <-otherReady(): } }()\n    return d.ctx.Err()",
+  );
+  const asyncIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { go func() { <-d.responseReady }() }()\n    return d.ctx.Err()",
+  );
+  const deferredIIFE = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    "case <-d.ctx.Done():\n    func() { defer func() { <-d.responseReady }() }()\n    return d.ctx.Err()",
+  );
+  for (const [index, source] of [conditionalHelper, competingIIFE, asyncIIFE, deferredIIFE].entries()) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId), `unsafe synchronization ${index}`);
+  }
+
+  const conditionalOwner = vulnerable.replace(
+    "if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    "if d.response != nil && shouldClose() { return d.response.Body.Close() }\n  return nil",
+  );
+  assert.ok((await repository(conditionalOwner)).signals.some((item) => item.ruleId === ruleId));
+});
+
 test("strings cannot fake producer cleanup or a response owner", async () => {
   const fakeCleanup = vulnerable.replace("d.response = response", 'd.response = response\n  log.Print("d.response.Body.Close()")');
   const fakeOwner = vulnerable.replace("if d.response == nil { return nil }\n  return d.response.Body.Close()", 'log.Print("d.response.Body.Close()")\n  return nil');
