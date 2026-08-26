@@ -599,7 +599,7 @@ function allPathsPerformInSequence(
       allPathsPerformInSequence(onFalse, action, source);
   }
 
-  if (statement.type === "expression_switch_statement") {
+  if (statement.type === "expression_switch_statement" || statement.type === "type_switch_statement") {
     const cases = directControlCases(statement, "expression_case");
     if (cases.length === 0 || !cases.some((candidate) => isDefaultCase(candidate, source))) return false;
     return cases.every((_, index) => {
@@ -622,7 +622,7 @@ function allPathsPerformInSequence(
 
   if (["return_statement", "goto_statement", "break_statement", "continue_statement", "fallthrough_statement"]
     .includes(statement.type)) return false;
-  if (["type_switch_statement", "for_statement"]
+  if (["for_statement"]
     .includes(statement.type)) return false;
   if (statement.type === "expression_statement") {
     const call = unwrapExpression(statement.namedChildren[0]);
@@ -635,8 +635,7 @@ function allPathsPerformInSequence(
 function directControlCases(control: Node, type: "expression_case" | "communication_case"): Node[] {
   return [...descendants(control, type), ...descendants(control, "default_case")]
     .filter((candidate) => {
-      const boundaryType = type === "expression_case" ? "expression_switch_statement" : "select_statement";
-      return sameSyntaxNode(nearestAncestorOfTypes(candidate, new Set([boundaryType])), control);
+      return sameSyntaxNode(nearestAncestorOfTypes(candidate, new Set([control.type])), control);
     })
     .sort((left, right) => left.startIndex - right.startIndex);
 }
@@ -654,11 +653,19 @@ function switchCasePath(cases: Node[], index: number, continuation: Node[], sour
   const transfer = statements[transferIndex]!;
   const prefix = statements.slice(0, transferIndex);
   if (transfer.type === "break_statement") {
-    const control = nearestAncestorOfTypes(cases[index]!, new Set(["expression_switch_statement"]));
+    const control = nearestAncestorOfTypes(cases[index]!, new Set([
+      "expression_switch_statement",
+      "type_switch_statement",
+    ]));
     return control !== null && breakTargetsControl(transfer, control, source)
       ? [...prefix, ...continuation]
       : undefined;
   }
+  const control = nearestAncestorOfTypes(cases[index]!, new Set([
+    "expression_switch_statement",
+    "type_switch_statement",
+  ]));
+  if (control?.type === "type_switch_statement") return undefined;
   if (transferIndex !== statements.length - 1 || index + 1 >= cases.length) return undefined;
   const following = switchCasePath(cases, index + 1, continuation, source);
   return following === undefined ? undefined : [...prefix, ...following];
@@ -1211,10 +1218,15 @@ function communicationAssignmentChangesBinding(
 ): boolean {
   const escaped = escapeRegExp(name);
   return descendants(owner, "communication_case").some((clause) => {
-    if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex || !containsNode(clause, use)) return false;
+    if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex) return false;
     const statements = clause.namedChildren.find((child) => child.type === "statement_list");
     const header = source.slice(clause.startIndex, statements?.startIndex ?? clause.endIndex);
-    return new RegExp(`(?:^|[,;\\s])${escaped}\\s*=(?!=)`).test(header);
+    if (!new RegExp(`(?:^|[,;\\s])${escaped}\\s*=(?!=)`).test(header)) return false;
+    if (containsNode(clause, use)) return true;
+    const selection = nearestAncestorOfTypes(clause, new Set(["select_statement"]));
+    if (selection === null || selection.endIndex >= use.startIndex) return false;
+    const cases = directControlCases(selection, "communication_case");
+    return cases.length === 1 && !cases.some((candidate) => isDefaultCase(candidate, source));
   });
 }
 

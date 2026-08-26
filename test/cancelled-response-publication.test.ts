@@ -1209,6 +1209,41 @@ test("binds cancellation synchronization and waiter guards to the original value
   assert.equal((await repository(selfAssignment)).signals.some((item) => item.ruleId === ruleId), false);
 });
 
+test("tracks guaranteed select rebinding and exhaustive type-switch synchronization", async () => {
+  const reboundOwner = ("var calls chan *duplexHTTPCall\n\n" + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(reboundOwner)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const exhaustiveTypeSwitch = vulnerable.replace(
+    "case <-d.ctx.Done():\n    return d.ctx.Err()",
+    `case <-d.ctx.Done():
+    switch any(mode()).(type) {
+    case int:
+      <-d.responseReady
+    case string:
+      <-d.responseReady
+    default:
+      <-d.responseReady
+    }
+    return d.ctx.Err()`,
+  );
+  assert.equal((await repository(exhaustiveTypeSwitch)).signals.some((item) => item.ruleId === ruleId), false);
+});
+
+test("harmless work around a waiter error guard does not make late cancellation safe", async () => {
+  const variants = [
+    "waitErr := d.BlockUntilResponseReady()\n  observe()\n  if waitErr != nil { return waitErr }",
+    "waitErr := d.BlockUntilResponseReady()\n  { waitErr := otherErr(); _ = waitErr }\n  if waitErr != nil { return waitErr }",
+    "waitErr := d.BlockUntilResponseReady()\n  unrelated := 1\n  _ = unrelated\n  if waitErr != nil { return waitErr }",
+  ];
+  for (const replacement of variants) {
+    const source = vulnerable.replace("_ = d.BlockUntilResponseReady()", replacement);
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+});
+
 test("handles select, fallthrough, infinite-loop, and deletion-only relationship reachability", async () => {
   const unreachableOwners = [
     vulnerable.replace(
