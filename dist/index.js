@@ -22406,9 +22406,13 @@ function communicationAssignmentChangesBinding(owner, name2, use, source, afterI
   if (body2 === null) return false;
   return descendants(owner, "communication_case").some((clause) => {
     if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex) return false;
+    let execution = clause;
     let lexicalOwner = owningFunction(clause);
     while (lexicalOwner !== null && !sameSyntaxNode(lexicalOwner, owner)) {
       if (lexicalOwner.type !== "func_literal" || !localNameUnshadowedAtUse(lexicalOwner, name2, clause, source)) return false;
+      const invocation = definiteClosureInvocation(lexicalOwner, execution, owner, use, source);
+      if (invocation === null) return false;
+      execution = invocation;
       lexicalOwner = owningFunction(lexicalOwner);
     }
     if (lexicalOwner === null) return false;
@@ -22422,8 +22426,54 @@ function communicationAssignmentChangesBinding(owner, name2, use, source, afterI
     if (containsNode(clause, use)) {
       return directlyReachableInBlock(body2, use, source) && executesWithin(selection, owner, source);
     }
-    if (selection.endIndex >= use.startIndex || !executesBeforeUse(owner, selection, use, source)) return false;
+    const executedNode = sameSyntaxNode(execution, clause) ? selection : execution;
+    if (executedNode.endIndex >= use.startIndex || !executesBeforeUse(owner, executedNode, use, source)) return false;
     return true;
+  });
+}
+function definiteClosureInvocation(literal, relationship, owner, use, source) {
+  const body2 = literal.childForFieldName("body");
+  if (body2 === null || !directlyReachableInBlock(body2, relationship, source)) return null;
+  const direct = directInvocationOfLiteral(literal);
+  if (direct !== null) return synchronousInvocation(direct) ? direct : null;
+  let binding = literal.parent;
+  while (binding !== null && !["short_var_declaration", "statement_list", "block"].includes(binding.type)) {
+    binding = binding.parent;
+  }
+  if (binding?.type !== "short_var_declaration" || !sameSyntaxNode(unwrapExpression(assignmentSides(binding)?.right) ?? null, literal)) return null;
+  const left = unwrapExpression(assignmentSides(binding)?.left);
+  if (left?.type !== "identifier") return null;
+  const closureName = sourceText(left, source).trim();
+  const bindingScope = enclosingBlock(binding);
+  if (!/^[A-Za-z_]\w*$/.test(closureName) || bindingScope === null || !containsNode(bindingScope, use)) return null;
+  for (const call of descendants(owner, "call_expression")) {
+    if (call.startIndex <= binding.endIndex || call.endIndex >= use.startIndex || !sameSyntaxNode(owningFunction(call), owner) || !pathEquals(callPath(call, source), [closureName]) || callArguments(call).length !== 0 || !containsNode(bindingScope, call) || !synchronousInvocation(call) || !executesBeforeUse(owner, call, use, source)) continue;
+    if (closureBindingChangedBetween(owner, binding, call, closureName, source)) continue;
+    return call;
+  }
+  return null;
+}
+function synchronousInvocation(call) {
+  let current = call.parent;
+  while (current !== null && current.type !== "statement_list" && current.type !== "block") {
+    if (["go_statement", "defer_statement"].includes(current.type)) return false;
+    current = current.parent;
+  }
+  return true;
+}
+function closureBindingChangedBetween(owner, binding, call, name2, source) {
+  if (descendants(owner, "assignment_statement").some((assignment) => {
+    if (assignment.startIndex <= binding.endIndex || assignment.endIndex >= call.startIndex || !sameSyntaxNode(owningFunction(assignment), owner)) return false;
+    const left = assignmentSides(assignment)?.left;
+    return left !== void 0 && directlyAssignsIdentifier(left, name2, source);
+  })) return true;
+  return [
+    ...descendants(owner, "short_var_declaration"),
+    ...descendants(owner, "var_spec")
+  ].some((declaration) => {
+    if (sameSyntaxNode(declaration, binding) || declaration.startIndex <= binding.endIndex || declaration.endIndex >= call.startIndex || !sameSyntaxNode(owningFunction(declaration), owner) || !declarationNames(declaration, source).has(name2)) return false;
+    const scope = enclosingBlock(declaration);
+    return scope !== null && containsNode(scope, call);
   });
 }
 function ownerLocalDeclarationShadows(owner, name2, use, source) {

@@ -1300,6 +1300,31 @@ test("select receiver invalidation is reachable, lexical, and deletion-aware", a
   );
   assert.equal((await repository(invokedCapture)).signals.some((item) => item.ruleId === ruleId), false);
 
+  const invokedStoredCapture = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  mutate := func() { select { case d = <-calls: default: } }; mutate()\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.equal((await repository(invokedStoredCapture)).signals.some((item) => item.ruleId === ruleId), false);
+
+  const reboundStoredCapture = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  mutate := func() { select { case d = <-calls: default: } }; mutate = func() {}; mutate()\n  _ = d.BlockUntilResponseReady()",
+  );
+  assert.ok((await repository(reboundStoredCapture)).signals.some((item) => item.ruleId === ruleId));
+
+  const nonSynchronousCaptures = [
+    "mutate := func() { select { case d = <-calls: default: } }; go mutate()",
+    "mutate := func() { select { case d = <-calls: default: } }; defer mutate()",
+    "go func() { select { case d = <-calls: default: } }()",
+  ];
+  for (const replacement of nonSynchronousCaptures) {
+    const source = (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      `  ${replacement}\n  _ = d.BlockUntilResponseReady()`,
+    );
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
   const twoValueReceive = ("var ok bool\n" + prefix + vulnerable).replace(
     "  _ = d.BlockUntilResponseReady()",
     "  select { case d, ok = <-calls: _ = ok; default: }\n  _ = d.BlockUntilResponseReady()",
