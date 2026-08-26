@@ -117,7 +117,7 @@ function aggregateErrorMetadataTrailerSignals(
         if (!contract.trailerMethods.has(name)) continue;
         const copies = descendants(body, "range_clause")
           .filter((candidate) =>
-            sameSyntaxNode(owningFunction(candidate), method) &&
+            executesWithin(candidate, body, lexicalSource) &&
             reachableWithinBoundary(body, candidate, lexicalSource)
           )
           .map((candidate) => metadataRangeCopy(
@@ -320,7 +320,7 @@ function metadataRangeCopy(
   const body = loop?.type === "for_statement" ? loop.childForFieldName("body") : null;
   if (body === null) return undefined;
   for (const assignment of descendants(body, "assignment_statement")) {
-    if (!sameSyntaxNode(owningFunction(assignment), method) ||
+    if (!executesWithin(assignment, body, lexicalSource) ||
       !reachableWithinBoundary(body, assignment, lexicalSource)) continue;
     const sides = assignmentSides(assignment);
     const indexed = unwrapExpression(sides?.left);
@@ -429,12 +429,35 @@ function returnedMetadataDestination(
   lexicalSource: string,
   source: string,
 ): Node | undefined {
-  return descendants(body, "return_statement").find((statement) =>
-    sameSyntaxNode(owningFunction(statement), method) &&
-    statement.startIndex > after.endIndex &&
-    reachableWithinBoundary(body, statement, lexicalSource) &&
-    sourceText(statement, source).replace(/\s+/g, "") === `return${destination}`
-  );
+  for (const statement of descendants(body, "return_statement")) {
+    if (!sameSyntaxNode(owningFunction(statement), method) ||
+      statement.startIndex <= after.endIndex ||
+      !reachableWithinBoundary(body, statement, lexicalSource)) continue;
+    const returnedName = /^return([A-Za-z_]\w*)$/.exec(
+      sourceText(statement, source).replace(/\s+/g, ""),
+    )?.[1];
+    if (returnedName === destination) return statement;
+    if (returnedName === undefined) continue;
+    const alias = [
+      ...descendants(body, "short_var_declaration"),
+      ...descendants(body, "assignment_statement"),
+    ].filter((candidate) =>
+      sameSyntaxNode(owningFunction(candidate), method) &&
+      candidate.startIndex > after.endIndex &&
+      candidate.endIndex < statement.startIndex
+    ).find((candidate) => {
+      const block = enclosingBlock(candidate);
+      if (block === null || !containsNode(block, statement) ||
+        !directlyReachableInBlock(block, candidate, lexicalSource)) return false;
+      return simpleBindingPairs(candidate, source).some((pair) =>
+        pair.name === returnedName && pathEquals(selectorPath(pair.right, source), [destination])
+      );
+    });
+    if (alias !== undefined &&
+      bindingPathPreserved(method, destination, alias, source, after.endIndex) &&
+      bindingPathPreserved(method, returnedName, statement, source, alias.endIndex)) return statement;
+  }
+  return undefined;
 }
 
 interface OwnedResponseState {

@@ -21537,7 +21537,7 @@ function aggregateErrorMetadataTrailerSignals(file, root, previousRoot) {
         const { contract } = baseFieldEvidence;
         if (!contract.trailerMethods.has(name2)) continue;
         const copies = descendants(body2, "range_clause").filter(
-          (candidate) => sameSyntaxNode(owningFunction(candidate), method) && reachableWithinBoundary(body2, candidate, lexicalSource)
+          (candidate) => executesWithin(candidate, body2, lexicalSource) && reachableWithinBoundary(body2, candidate, lexicalSource)
         ).map((candidate) => metadataRangeCopy(
           candidate,
           method,
@@ -21703,7 +21703,7 @@ function metadataRangeCopy(range, method, lexicalSource, source, stringsAliases)
   const body2 = loop?.type === "for_statement" ? loop.childForFieldName("body") : null;
   if (body2 === null) return void 0;
   for (const assignment of descendants(body2, "assignment_statement")) {
-    if (!sameSyntaxNode(owningFunction(assignment), method) || !reachableWithinBoundary(body2, assignment, lexicalSource)) continue;
+    if (!executesWithin(assignment, body2, lexicalSource) || !reachableWithinBoundary(body2, assignment, lexicalSource)) continue;
     const sides = assignmentSides(assignment);
     const indexed = unwrapExpression(sides?.left);
     if (sides === void 0 || indexed?.type !== "index_expression") continue;
@@ -21781,9 +21781,28 @@ function positiveTrailerKeyPredicate(condition, method, key, stringsAliases, sou
   return false;
 }
 function returnedMetadataDestination(method, body2, destination, after, lexicalSource, source) {
-  return descendants(body2, "return_statement").find(
-    (statement) => sameSyntaxNode(owningFunction(statement), method) && statement.startIndex > after.endIndex && reachableWithinBoundary(body2, statement, lexicalSource) && sourceText(statement, source).replace(/\s+/g, "") === `return${destination}`
-  );
+  for (const statement of descendants(body2, "return_statement")) {
+    if (!sameSyntaxNode(owningFunction(statement), method) || statement.startIndex <= after.endIndex || !reachableWithinBoundary(body2, statement, lexicalSource)) continue;
+    const returnedName = /^return([A-Za-z_]\w*)$/.exec(
+      sourceText(statement, source).replace(/\s+/g, "")
+    )?.[1];
+    if (returnedName === destination) return statement;
+    if (returnedName === void 0) continue;
+    const alias = [
+      ...descendants(body2, "short_var_declaration"),
+      ...descendants(body2, "assignment_statement")
+    ].filter(
+      (candidate) => sameSyntaxNode(owningFunction(candidate), method) && candidate.startIndex > after.endIndex && candidate.endIndex < statement.startIndex
+    ).find((candidate) => {
+      const block = enclosingBlock(candidate);
+      if (block === null || !containsNode(block, statement) || !directlyReachableInBlock(block, candidate, lexicalSource)) return false;
+      return simpleBindingPairs(candidate, source).some(
+        (pair) => pair.name === returnedName && pathEquals(selectorPath(pair.right, source), [destination])
+      );
+    });
+    if (alias !== void 0 && bindingPathPreserved(method, destination, alias, source, after.endIndex) && bindingPathPreserved(method, returnedName, statement, source, alias.endIndex)) return statement;
+  }
+  return void 0;
 }
 function cancelledResponsePublicationSignals(file, root, previousRoot) {
   const httpAliases = standardImportAliases(root, file.current, "net/http", "http");

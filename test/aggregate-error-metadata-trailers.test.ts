@@ -238,6 +238,39 @@ test("rejects receiver rebinding, field replacement, and uninvoked nested copies
   }
 });
 
+test("follows synchronous direct copies but rejects stored, async, and shadowed closures", async () => {
+  const direct = vulnerable
+    .replace(
+      "for k, v := range w.base.ResponseTrailer() {\n      combined[k] = v\n    }",
+      "func() { for k, v := range w.base.ResponseTrailer() { combined[k] = v } }()",
+    )
+    .replace(
+      "for k, v := range w.err.Meta() {\n      combined[k] = v\n    }",
+      "func() { for k, v := range w.err.Meta() { combined[k] = v } }()",
+    );
+  const executed = await repository(direct);
+  assert.equal(executed.signals.filter((item) => item.ruleId === ruleId).length, 1, JSON.stringify(executed.signals, null, 2));
+
+  for (const source of [
+    direct.replace("func() { for k, v := range w.err.Meta() { combined[k] = v } }()", "go func() { for k, v := range w.err.Meta() { combined[k] = v } }()"),
+    direct.replace("func() { for k, v := range w.err.Meta() { combined[k] = v } }()", "copyMeta := func() { for k, v := range w.err.Meta() { combined[k] = v } }; _ = copyMeta"),
+    direct.replace("func() { for k, v := range w.err.Meta() { combined[k] = v } }()", "func(w *errorResponseWrapper) { for k, v := range w.err.Meta() { combined[k] = v } }(w)"),
+  ]) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+});
+
+test("follows a same-block alias of the returned metadata map", async () => {
+  const aliased = vulnerable.replace("return combined\n}", "result := combined\n  return result\n}");
+  const result = await repository(aliased);
+  assert.equal(result.signals.filter((item) => item.ruleId === ruleId).length, 1, JSON.stringify(result.signals, null, 2));
+
+  const replaced = aliased.replace("result := combined", "result := make(http.Header)");
+  const quiet = await repository(replaced);
+  assert.equal(quiet.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(quiet.signals, null, 2));
+});
+
 test("diff mode reports the changed aggregate merge and ignores comment-only edits", async () => {
   const addedLine = lineOf(vulnerable, "for k, v := range w.err.Meta()");
   const changed = await analyzeDiscovery({
