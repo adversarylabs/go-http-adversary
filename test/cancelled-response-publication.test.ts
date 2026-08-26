@@ -757,6 +757,102 @@ test("accepts synchronous producer and cancellation cleanup through bounded dire
   }
 });
 
+test("tracks all-path waits and receiver identity through executed control flow", async () => {
+  const bypassingWaits = [
+    vulnerable.replace(
+      "case <-d.ctx.Done():\n    return d.ctx.Err()",
+      "case <-d.ctx.Done():\n    func() { if shouldSkip() { return }; <-d.responseReady }()\n    return d.ctx.Err()",
+    ),
+    vulnerable.replace(
+      `case <-d.ctx.Done():
+    return d.ctx.Err()
+  }
+}`,
+      `case <-d.ctx.Done():
+    if shouldSkip() { goto done }
+    <-d.responseReady
+    return d.ctx.Err()
+  }
+done:
+  return d.ctx.Err()
+}`,
+    ),
+  ];
+  for (const source of bypassingWaits) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const receiverChanges = [
+    vulnerable
+      .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+      .replace(
+        "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+        "func (d *duplexHTTPCall) start() { func() { d = other }(); go d.makeRequest() }",
+      ),
+    vulnerable
+      .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+      .replace(
+        "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+        "func (d *duplexHTTPCall) start() { for _, d = range []*duplexHTTPCall{other} { go d.makeRequest() } }",
+      ),
+    vulnerable
+      .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+      .replace(
+        "_ = d.BlockUntilResponseReady()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+        "_ = d.BlockUntilResponseReady()\n  func() { d = other }()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      ),
+  ];
+  for (const source of receiverChanges) {
+    const result = await repository(source);
+    assert.equal(result.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(result.signals, null, 2));
+  }
+
+  const unreachableChange = vulnerable
+    .replace("type duplexHTTPCall struct {", "var other *duplexHTTPCall\n\ntype duplexHTTPCall struct {")
+    .replace(
+      "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+      "func (d *duplexHTTPCall) start() { if false { d = other }; go d.makeRequest() }",
+    );
+  assert.ok((await repository(unreachableChange)).signals.some((item) => item.ruleId === ruleId));
+});
+
+test("recognizes caller-side bounded re-observation and producer activation locality", async () => {
+  const boundedCaller = vulnerable
+    .replace(
+      "func (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+      "func (d *duplexHTTPCall) awaitLate() { <-d.responseReady }\nfunc (d *duplexHTTPCall) BlockUntilResponseReady() error {",
+    )
+    .replace(
+      "_ = d.BlockUntilResponseReady()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+      "_ = d.BlockUntilResponseReady()\n  d.awaitLate()\n  if d.response == nil { return nil }\n  return d.response.Body.Close()",
+    );
+  assert.equal(
+    (await repository(boundedCaller)).signals.some((item) => item.ruleId === ruleId),
+    false,
+  );
+
+  const previous = vulnerable.replace(
+    "func (d *duplexHTTPCall) start() { go d.makeRequest() }",
+    "func (d *duplexHTTPCall) start() { if false { go d.makeRequest() } }",
+  );
+  const current = previous.replace("if false { go", "if shouldStart() { go");
+  const changedLine = lineOf(current, "if shouldStart()");
+  const result = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([changedLine]),
+    }],
+  });
+  const signal = result.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal, JSON.stringify(result.signals, null, 2));
+  assert.equal(signal.line, changedLine);
+});
+
 test("a reset after direct completion signalling does not erase the publication race", async () => {
   const source = vulnerable
     .replace("defer close(d.responseReady)\n", "")
