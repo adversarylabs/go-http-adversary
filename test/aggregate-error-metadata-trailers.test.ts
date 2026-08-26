@@ -269,3 +269,41 @@ test("diff mode reports the changed aggregate merge and ignores comment-only edi
   });
   assert.equal(quiet.signals.some((item) => item.ruleId === ruleId), false, JSON.stringify(quiet.signals, null, 2));
 });
+
+test("diff mode anchors a newly proven classified interface or error field", async () => {
+  const trailerLine = lineOf(vulnerable, "ResponseTrailer() http.Header");
+  const interfaceActivated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "context.go",
+      previous: vulnerable.replace("ResponseTrailer() http.Header", "ResponseTrailer() map[string][]string"),
+      current: vulnerable,
+      status: "modified",
+      changedLines: new Set([trailerLine]),
+    }],
+  });
+  assert.equal(
+    interfaceActivated.signals.find((item) => item.ruleId === ruleId)?.line,
+    trailerLine,
+    JSON.stringify(interfaceActivated.signals, null, 2),
+  );
+
+  const fieldLine = lineOf(vulnerable, "err *Error");
+  const fieldActivated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "context.go",
+      previous: vulnerable.replace("err *Error", "err *Metadata"),
+      current: vulnerable,
+      status: "modified",
+      changedLines: new Set([fieldLine]),
+    }],
+  });
+  assert.equal(
+    fieldActivated.signals.find((item) => item.ruleId === ruleId)?.line,
+    fieldLine,
+    JSON.stringify(fieldActivated.signals, null, 2),
+  );
+});

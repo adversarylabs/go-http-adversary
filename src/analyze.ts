@@ -53,14 +53,14 @@ export async function analyzeDiscovery(discovery: Discovery): Promise<Analysis> 
 
 interface ClassifiedMetadataInterface {
   typeName: string;
-  headerMethods: Set<string>;
-  trailerMethods: Set<string>;
+  headerMethods: Map<string, Node>;
+  trailerMethods: Map<string, Node>;
 }
 
 interface MetadataWrapper {
   typeName: string;
-  baseFields: Map<string, ClassifiedMetadataInterface>;
-  errorFields: Set<string>;
+  baseFields: Map<string, { contract: ClassifiedMetadataInterface; node: Node }>;
+  errorFields: Map<string, Node>;
 }
 
 interface MetadataRangeCopy {
@@ -112,7 +112,8 @@ function aggregateErrorMetadataTrailerSignals(
       const body = method.childForFieldName("body");
       if (receiver === undefined || name === undefined || body === null) continue;
 
-      for (const [baseField, contract] of wrapper.baseFields) {
+      for (const [baseField, baseFieldEvidence] of wrapper.baseFields) {
+        const { contract } = baseFieldEvidence;
         if (!contract.trailerMethods.has(name)) continue;
         const copies = descendants(body, "range_clause")
           .filter((candidate) =>
@@ -134,7 +135,7 @@ function aggregateErrorMetadataTrailerSignals(
           selectorPathPreserved(method, [receiver, baseField], copy.range, file.current, body.startIndex)
         );
 
-        for (const errorField of wrapper.errorFields) {
+        for (const [errorField, errorFieldEvidence] of wrapper.errorFields) {
           const aggregateCopies = copies.filter((copy) =>
             ["Meta", "Metadata"].includes(copy.sourcePath[2] ?? "") &&
             !copy.partitioned &&
@@ -183,7 +184,15 @@ function aggregateErrorMetadataTrailerSignals(
               file,
               root,
               previousRoot,
-              [aggregate.range, base.range, returned],
+              [
+                aggregate.range,
+                base.range,
+                returned,
+                baseFieldEvidence.node,
+                errorFieldEvidence,
+                ...contract.headerMethods.values(),
+                contract.trailerMethods.get(name)!,
+              ],
             );
             if (changedEvidence === undefined ||
               (file.status === "modified" && previousSignatures.has(signature) &&
@@ -239,14 +248,14 @@ function classifiedMetadataInterfaces(
     const name = typeSpec.childForFieldName("name");
     const type = typeSpec.childForFieldName("type");
     if (name === null || type?.type !== "interface_type") continue;
-    const headerMethods = new Set<string>();
-    const trailerMethods = new Set<string>();
+    const headerMethods = new Map<string, Node>();
+    const trailerMethods = new Map<string, Node>();
     for (const method of descendants(type, "method_elem")) {
       const methodNameNode = method.childForFieldName("name") ?? method.namedChildren[0];
       if (methodNameNode === undefined || !returnsHTTPHeader(method, source, httpAliases)) continue;
       const methodNameText = sourceText(methodNameNode, source);
-      if (/Header$/.test(methodNameText)) headerMethods.add(methodNameText);
-      if (/Trailer$/.test(methodNameText)) trailerMethods.add(methodNameText);
+      if (/Header$/.test(methodNameText)) headerMethods.set(methodNameText, method);
+      if (/Trailer$/.test(methodNameText)) trailerMethods.set(methodNameText, method);
     }
     if (headerMethods.size === 0 || trailerMethods.size === 0) continue;
     const typeName = sourceText(name, source);
@@ -270,8 +279,8 @@ function metadataWrappers(
     const name = typeSpec.childForFieldName("name");
     const type = typeSpec.childForFieldName("type");
     if (name === null || type?.type !== "struct_type") continue;
-    const baseFields = new Map<string, ClassifiedMetadataInterface>();
-    const errorFields = new Set<string>();
+    const baseFields = new Map<string, { contract: ClassifiedMetadataInterface; node: Node }>();
+    const errorFields = new Map<string, Node>();
     for (const field of descendants(type, "field_declaration")) {
       if (!sameSyntaxNode(field.parent?.parent ?? null, type)) continue;
       const fieldType = field.childForFieldName("type");
@@ -281,8 +290,8 @@ function metadataWrappers(
       const typeText = sourceText(fieldType, source).replace(/\s+/g, "").replace(/^\*+/, "");
       const contract = interfaces.get(typeText);
       for (const fieldName of names) {
-        if (contract !== undefined) baseFields.set(fieldName, contract);
-        if (/(?:^|\.)[A-Za-z_]*Error$/.test(typeText)) errorFields.add(fieldName);
+        if (contract !== undefined) baseFields.set(fieldName, { contract, node: field });
+        if (/(?:^|\.)[A-Za-z_]*Error$/.test(typeText)) errorFields.set(fieldName, field);
       }
     }
     if (baseFields.size > 0 && errorFields.size > 0) {
