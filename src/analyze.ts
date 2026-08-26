@@ -147,7 +147,10 @@ function cancelledResponsePublicationSignals(file: SourceRevision, root: Node, p
                 file,
                 root,
                 previousRoot,
-                cancellationActivationStatements(waiter.cancellationCase),
+                [
+                  ...responseOwnerActivationStatements(owner),
+                  ...cancellationActivationStatements(waiter.cancellationCase),
+                ],
               ) ?? publisher.asyncStart
               : undefined);
           if (evidence === undefined) continue;
@@ -1227,14 +1230,20 @@ function communicationAssignmentChangesBinding(
   afterIndex: number,
 ): boolean {
   const escaped = escapeRegExp(name);
+  const body = owner.childForFieldName("body");
+  if (body === null) return false;
   return descendants(owner, "communication_case").some((clause) => {
     if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex) return false;
+    if (!sameSyntaxNode(owningFunction(clause), owner)) return false;
     const statements = clause.namedChildren.find((child) => child.type === "statement_list");
     const header = source.slice(clause.startIndex, statements?.startIndex ?? clause.endIndex);
     if (!new RegExp(`(?:^|[,;\\s])${escaped}\\s*=(?!=)`).test(header)) return false;
-    if (containsNode(clause, use)) return true;
     const selection = nearestAncestorOfTypes(clause, new Set(["select_statement"]));
-    if (selection === null || selection.endIndex >= use.startIndex) return false;
+    if (selection === null) return false;
+    if (containsNode(clause, use)) {
+      return directlyReachableInBlock(body, use, source) && executesWithin(selection, owner, source);
+    }
+    if (selection.endIndex >= use.startIndex || !executesBeforeUse(owner, selection, use, source)) return false;
     // A receive assignment in any selectable arm makes the receiver reaching a
     // later use path-dependent. Do not attribute that use to the pre-select
     // receiver, even when another arm or a default could preserve it.
@@ -1313,6 +1322,14 @@ function cancellationActivationStatements(cancellationCase: Node): Node[] {
     ...descendants(cancellationCase, "send_statement"),
     ...descendants(cancellationCase, "inc_statement"),
   ].sort((left, right) => left.startIndex - right.startIndex);
+}
+
+function responseOwnerActivationStatements(owner: ResponseOwner): Node[] {
+  return descendants(owner.method, "select_statement")
+    .filter((selection) =>
+      selection.endIndex < owner.waitCall.startIndex && sameSyntaxNode(owningFunction(selection), owner.method)
+    )
+    .sort((left, right) => left.startIndex - right.startIndex);
 }
 
 function receiveTargetPath(node: Node, source: string): string[] | undefined {

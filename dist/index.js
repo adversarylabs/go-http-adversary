@@ -21561,7 +21561,10 @@ function cancelledResponsePublicationSignals(file, root, previousRoot) {
             file,
             root,
             previousRoot,
-            cancellationActivationStatements(waiter.cancellationCase)
+            [
+              ...responseOwnerActivationStatements(owner),
+              ...cancellationActivationStatements(waiter.cancellationCase)
+            ]
           ) ?? publisher.asyncStart : void 0);
           if (evidence === void 0) continue;
           signals.push({
@@ -22400,14 +22403,20 @@ function rangeAssignmentChangesBinding(owner, name2, use, source, afterIndex) {
 }
 function communicationAssignmentChangesBinding(owner, name2, use, source, afterIndex) {
   const escaped = escapeRegExp(name2);
+  const body2 = owner.childForFieldName("body");
+  if (body2 === null) return false;
   return descendants(owner, "communication_case").some((clause) => {
     if (clause.startIndex <= afterIndex || clause.startIndex >= use.startIndex) return false;
+    if (!sameSyntaxNode(owningFunction(clause), owner)) return false;
     const statements = clause.namedChildren.find((child) => child.type === "statement_list");
     const header = source.slice(clause.startIndex, statements?.startIndex ?? clause.endIndex);
     if (!new RegExp(`(?:^|[,;\\s])${escaped}\\s*=(?!=)`).test(header)) return false;
-    if (containsNode(clause, use)) return true;
     const selection = nearestAncestorOfTypes(clause, /* @__PURE__ */ new Set(["select_statement"]));
-    if (selection === null || selection.endIndex >= use.startIndex) return false;
+    if (selection === null) return false;
+    if (containsNode(clause, use)) {
+      return directlyReachableInBlock(body2, use, source) && executesWithin(selection, owner, source);
+    }
+    if (selection.endIndex >= use.startIndex || !executesBeforeUse(owner, selection, use, source)) return false;
     return true;
   });
 }
@@ -22475,6 +22484,11 @@ function cancellationActivationStatements(cancellationCase) {
     ...descendants(cancellationCase, "send_statement"),
     ...descendants(cancellationCase, "inc_statement")
   ].sort((left, right) => left.startIndex - right.startIndex);
+}
+function responseOwnerActivationStatements(owner) {
+  return descendants(owner.method, "select_statement").filter(
+    (selection) => selection.endIndex < owner.waitCall.startIndex && sameSyntaxNode(owningFunction(selection), owner.method)
+  ).sort((left, right) => left.startIndex - right.startIndex);
 }
 function receiveTargetPath(node, source) {
   const owner = owningFunction(node);

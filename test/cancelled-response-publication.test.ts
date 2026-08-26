@@ -1274,6 +1274,48 @@ test("tracks select rebinding and exhaustive type-switch synchronization", async
   assert.equal(signal.line, changedLine);
 });
 
+test("select receiver invalidation is reachable, lexical, and deletion-aware", async () => {
+  const prefix = "var calls chan *duplexHTTPCall\n\n";
+  const preserved = [
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  if false { select { case d = <-calls: } }\n  _ = d.BlockUntilResponseReady()",
+    ),
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  work := func() { select { case d = <-calls: } }; _ = work\n  _ = d.BlockUntilResponseReady()",
+    ),
+    (prefix + vulnerable).replace(
+      "  _ = d.BlockUntilResponseReady()",
+      "  work := func(d *duplexHTTPCall) { select { case d = <-calls: } }; _ = work\n  _ = d.BlockUntilResponseReady()",
+    ),
+  ];
+  for (const source of preserved) {
+    assert.ok((await repository(source)).signals.some((item) => item.ruleId === ruleId));
+  }
+
+  const previous = (prefix + vulnerable).replace(
+    "  _ = d.BlockUntilResponseReady()",
+    "  select { case d = <-calls: _ = d; default: }\n  _ = d.BlockUntilResponseReady()",
+  );
+  const current = previous.replace("case d = <-calls", "case d := <-calls");
+  const line = lineOf(current, "case d :=");
+  const activated = await analyzeDiscovery({
+    mode: "diff",
+    base: "main",
+    files: [{
+      path: "duplex_http_call.go",
+      current,
+      previous,
+      status: "modified",
+      changedLines: new Set([line]),
+    }],
+  });
+  const signal = activated.signals.find((item) => item.ruleId === ruleId);
+  assert.ok(signal);
+  assert.equal(signal.line, line);
+});
+
 test("harmless work around a waiter error guard does not make late cancellation safe", async () => {
   const variants = [
     "waitErr := d.BlockUntilResponseReady()\n  observe()\n  if waitErr != nil { return waitErr }",
