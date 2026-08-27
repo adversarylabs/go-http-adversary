@@ -17168,6 +17168,18 @@ var domain = {
       recommendation: "After checking the request error, defer response.Body.Close before consuming the body; if the response is returned, make that ownership transfer explicit."
     },
     {
+      id: "go-http.aggregate-error-metadata-as-trailers",
+      title: "Aggregate error metadata is reclassified as response trailers",
+      concern: "unclassified aggregate error metadata merged into classified response trailers",
+      category: "correctness",
+      severity: "medium",
+      confidence: "medium",
+      summary: (count) => `${count} response metadata wrapper${count === 1 ? " merges" : "s merge"} aggregate error metadata into a retained trailer channel.`,
+      whyItMatters: "Aggregate error metadata can contain both response headers and trailers; copying it into trailers loses channel identity and can duplicate values already exposed by the underlying response.",
+      impact: "Clients can observe response headers as trailers or receive duplicated metadata, producing protocol-dependent behavior and misleading CallInfo-style APIs.",
+      recommendation: "Preserve the underlying classified header and trailer channels. Expose aggregate error metadata only through its aggregate API, or partition it with a proven protocol marker before assigning it to a channel."
+    },
+    {
       id: "go-http.cancelled-response-publication",
       title: "Cancellation can abandon a concurrently published HTTP response",
       concern: "HTTP responses abandoned by a cancellation/completion race",
@@ -21486,6 +21498,11 @@ async function analyzeDiscovery(discovery) {
           signals.push(...responseWriterCapabilitySignals(file, tree.rootNode));
           signals.push(...providerResponseBufferSignals(file, tree.rootNode));
           signals.push(...clientResponseBodyCloseSignals(file, tree.rootNode));
+          signals.push(...aggregateErrorMetadataTrailerSignals(
+            file,
+            tree.rootNode,
+            previousTree?.rootNode.hasError === false ? previousTree.rootNode : void 0
+          ));
           signals.push(...cancelledResponsePublicationSignals(
             file,
             tree.rootNode,
@@ -21511,6 +21528,301 @@ async function analyzeDiscovery(discovery) {
     positives: positives.sort(byLocation),
     parseErrors: parseErrors.sort((left, right) => left.path.localeCompare(right.path))
   };
+}
+function aggregateErrorMetadataTrailerSignals(file, root, previousRoot) {
+  if (!domain.includePath(file.path)) return [];
+  const httpAliases = standardImportAliases(root, file.current, "net/http", "http");
+  if (httpAliases.size === 0) return [];
+  const stringsAliases = standardImportAliases(root, file.current, "strings", "strings");
+  const interfaces = classifiedMetadataInterfaces(root, file.current, httpAliases);
+  if (interfaces.size === 0) return [];
+  const wrappers = metadataWrappers(root, file.current, interfaces);
+  if (wrappers.length === 0) return [];
+  const lexicalSource = maskGoLexicalNoise(root, file.current);
+  const previousSignatures = previousRoot === void 0 || file.previous === void 0 ? /* @__PURE__ */ new Set() : new Set(aggregateErrorMetadataTrailerSignals({
+    path: file.path,
+    current: file.previous,
+    status: "repository",
+    changedLines: /* @__PURE__ */ new Set()
+  }, previousRoot).map(aggregateErrorMetadataTrailerSignature));
+  const signals = [];
+  for (const wrapper of wrappers) {
+    for (const method of descendants(root, "method_declaration")) {
+      if (methodReceiverType(method, file.current) !== wrapper.typeName) continue;
+      const receiver = methodReceiverName(method, file.current);
+      const name2 = methodName(method, file.current);
+      const body2 = method.childForFieldName("body");
+      if (receiver === void 0 || name2 === void 0 || body2 === null) continue;
+      for (const [baseField, baseFieldEvidence] of wrapper.baseFields) {
+        const { contract } = baseFieldEvidence;
+        if (!contract.trailerMethods.has(name2)) continue;
+        const copies = descendants(body2, "range_clause").filter(
+          (candidate) => executesWithin(candidate, body2, lexicalSource) && reachableWithinBoundary(body2, candidate, lexicalSource)
+        ).map((candidate) => metadataRangeCopy(
+          candidate,
+          method,
+          lexicalSource,
+          file.current,
+          stringsAliases
+        )).filter((candidate) => candidate !== void 0);
+        const baseCopies = copies.filter(
+          (copy) => contract.trailerMethods.has(copy.sourcePath[2] ?? "") && pathEquals(copy.sourcePath.slice(0, 2), [receiver, baseField]) && receiverBindingPreserved(method, receiver, copy.range, file.current) && selectorPathPreserved(method, [receiver, baseField], copy.range, file.current, body2.startIndex)
+        );
+        for (const [errorField, errorFieldEvidence] of wrapper.errorFields) {
+          const aggregateCopies = copies.filter(
+            (copy) => ["Meta", "Metadata"].includes(copy.sourcePath[2] ?? "") && !copy.partitioned && pathEquals(copy.sourcePath.slice(0, 2), [receiver, errorField]) && receiverBindingPreserved(method, receiver, copy.range, file.current) && selectorPathPreserved(method, [receiver, errorField], copy.range, file.current, body2.startIndex)
+          );
+          for (const aggregate of aggregateCopies) {
+            const base = baseCopies.find((copy) => copy.destination === aggregate.destination);
+            if (base === void 0) continue;
+            const [firstCopy, secondCopy] = [base, aggregate].sort(
+              (left, right) => left.range.startIndex - right.range.startIndex
+            );
+            if (!bindingPathPreserved(
+              method,
+              aggregate.destination,
+              secondCopy.range,
+              file.current,
+              firstCopy.range.endIndex
+            )) continue;
+            const returned = returnedMetadataDestination(
+              method,
+              body2,
+              aggregate.destination,
+              secondCopy.range,
+              lexicalSource,
+              file.current
+            );
+            if (returned === void 0 || !bindingPathPreserved(
+              method,
+              aggregate.destination,
+              returned,
+              file.current,
+              secondCopy.range.endIndex
+            )) continue;
+            const signature = [
+              wrapper.typeName,
+              name2,
+              baseField,
+              errorField,
+              aggregate.destination,
+              aggregate.sourcePath[2]
+            ].join("|");
+            const changedEvidence = firstChangedNode(
+              file,
+              root,
+              previousRoot,
+              [
+                aggregate.range,
+                base.range,
+                returned,
+                baseFieldEvidence.node,
+                errorFieldEvidence,
+                ...contract.headerMethods.values(),
+                contract.trailerMethods.get(name2)
+              ]
+            );
+            if (changedEvidence === void 0 || file.status === "modified" && previousSignatures.has(signature) && !nodeSemanticallyChanged(file, root, previousRoot, aggregate.range)) continue;
+            signals.push({
+              ruleId: "go-http.aggregate-error-metadata-as-trailers",
+              path: file.path,
+              line: changedEvidence.startPosition.row + 1,
+              endLine: changedEvidence.endPosition.row + 1,
+              message: `${wrapper.typeName}.${name2} copies classified ${baseField} trailers and ${errorField}.${aggregate.sourcePath[2]}() into the same map even though the error metadata does not preserve header/trailer provenance.`,
+              snippet: sourceText(changedEvidence, file.current).trim().slice(0, 300),
+              data: {
+                wrapper: wrapper.typeName,
+                trailerMethod: name2,
+                baseField,
+                errorField,
+                aggregateMethod: aggregate.sourcePath[2],
+                destination: aggregate.destination,
+                baseCopyLine: base.range.startPosition.row + 1,
+                aggregateCopyLine: aggregate.range.startPosition.row + 1
+              }
+            });
+          }
+        }
+      }
+    }
+  }
+  return signals;
+}
+function aggregateErrorMetadataTrailerSignature(signal) {
+  return [
+    signal.data.wrapper,
+    signal.data.trailerMethod,
+    signal.data.baseField,
+    signal.data.errorField,
+    signal.data.destination,
+    signal.data.aggregateMethod
+  ].join("|");
+}
+function classifiedMetadataInterfaces(root, source, httpAliases) {
+  const contracts = /* @__PURE__ */ new Map();
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const name2 = typeSpec.childForFieldName("name");
+    const type = typeSpec.childForFieldName("type");
+    if (name2 === null || type?.type !== "interface_type") continue;
+    const headerMethods = /* @__PURE__ */ new Map();
+    const trailerMethods = /* @__PURE__ */ new Map();
+    for (const method of descendants(type, "method_elem")) {
+      const methodNameNode = method.childForFieldName("name") ?? method.namedChildren[0];
+      if (methodNameNode === void 0 || !returnsHTTPHeader(method, source, httpAliases)) continue;
+      const methodNameText = sourceText(methodNameNode, source);
+      if (/Header$/.test(methodNameText)) headerMethods.set(methodNameText, method);
+      if (/Trailer$/.test(methodNameText)) trailerMethods.set(methodNameText, method);
+    }
+    if (headerMethods.size === 0 || trailerMethods.size === 0) continue;
+    const typeName = sourceText(name2, source);
+    contracts.set(typeName, { typeName, headerMethods, trailerMethods });
+  }
+  return contracts;
+}
+function returnsHTTPHeader(node, source, httpAliases) {
+  const text = sourceText(node, source).replace(/\s+/g, "");
+  return [...httpAliases].some((alias) => text.endsWith(`${alias}.Header`));
+}
+function metadataWrappers(root, source, interfaces) {
+  const wrappers = [];
+  for (const typeSpec of descendants(root, "type_spec")) {
+    const name2 = typeSpec.childForFieldName("name");
+    const type = typeSpec.childForFieldName("type");
+    if (name2 === null || type?.type !== "struct_type") continue;
+    const baseFields = /* @__PURE__ */ new Map();
+    const errorFields = /* @__PURE__ */ new Map();
+    for (const field of descendants(type, "field_declaration")) {
+      if (!sameSyntaxNode(field.parent?.parent ?? null, type)) continue;
+      const fieldType = field.childForFieldName("type");
+      if (fieldType === null) continue;
+      const prefix = source.slice(field.startIndex, fieldType.startIndex).trim();
+      const names = prefix.split(",").map((item) => item.trim()).filter((item) => /^[A-Za-z_]\w*$/.test(item));
+      const typeText = sourceText(fieldType, source).replace(/\s+/g, "").replace(/^\*+/, "");
+      const contract = interfaces.get(typeText);
+      for (const fieldName of names) {
+        if (contract !== void 0) baseFields.set(fieldName, { contract, node: field });
+        if (/(?:^|\.)[A-Za-z_]*Error$/.test(typeText)) errorFields.set(fieldName, field);
+      }
+    }
+    if (baseFields.size > 0 && errorFields.size > 0) {
+      wrappers.push({ typeName: sourceText(name2, source), baseFields, errorFields });
+    }
+  }
+  return wrappers;
+}
+function metadataRangeCopy(range, method, lexicalSource, source, stringsAliases) {
+  const right = unwrapExpression(range.childForFieldName("right"));
+  if (right?.type !== "call_expression" || callArguments(right).length !== 0) return void 0;
+  const sourcePath = callPath(right, source);
+  if (sourcePath?.length !== 3) return void 0;
+  const left = range.childForFieldName("left");
+  const names = left === null ? [] : descendants(left, "identifier").map((node) => sourceText(node, source));
+  const [key, value] = names;
+  if (key === void 0 || value === void 0) return void 0;
+  const loop = range.parent;
+  const body2 = loop?.type === "for_statement" ? loop.childForFieldName("body") : null;
+  if (body2 === null) return void 0;
+  for (const assignment of descendants(body2, "assignment_statement")) {
+    if (!executesWithin(assignment, body2, lexicalSource) || !reachableWithinBoundary(body2, assignment, lexicalSource)) continue;
+    const sides = assignmentSides(assignment);
+    const indexed = unwrapExpression(sides?.left);
+    if (sides === void 0 || indexed?.type !== "index_expression") continue;
+    const destination = selectorPath(indexed.childForFieldName("operand"), source);
+    const indexNode = indexed.childForFieldName("index");
+    const indexNames = indexNode === null ? [] : descendants(indexNode, "identifier").map((node) => sourceText(node, source));
+    if (destination?.length !== 1 || !indexNames.includes(key)) continue;
+    const values = descendants(sides.right, "identifier").map((node) => sourceText(node, source));
+    if (!values.includes(value)) continue;
+    return {
+      range,
+      destination: destination[0],
+      sourcePath,
+      partitioned: metadataCopyHasTrailerPartition(
+        assignment,
+        body2,
+        method,
+        key,
+        stringsAliases,
+        source
+      )
+    };
+  }
+  return void 0;
+}
+function metadataCopyHasTrailerPartition(assignment, body2, method, key, stringsAliases, source) {
+  let current = assignment.parent;
+  while (current !== null && !sameSyntaxNode(current, body2)) {
+    if (current.type === "if_statement") {
+      const condition = current.childForFieldName("condition");
+      if (condition !== null && positiveTrailerKeyPredicate(
+        condition,
+        method,
+        key,
+        stringsAliases,
+        source
+      )) {
+        return true;
+      }
+    }
+    current = current.parent;
+  }
+  return false;
+}
+function positiveTrailerKeyPredicate(condition, method, key, stringsAliases, source) {
+  for (const call of [condition, ...descendants(condition, "call_expression")]) {
+    if (call.type !== "call_expression") continue;
+    const path = callPath(call, source);
+    if (path?.length !== 2 || !stringsAliases.has(path[0]) || path[1] !== "HasPrefix" || !localNameUnshadowedAtUse(method, path[0], call, source)) continue;
+    const args2 = callArguments(call);
+    if (args2.length !== 2 || !pathEquals(selectorPath(args2[0], source), [key])) continue;
+    const marker = unwrapExpression(args2[1]);
+    if (marker === void 0 || !["interpreted_string_literal", "raw_string_literal"].includes(marker.type) || !/trailer/i.test(sourceText(marker, source))) continue;
+    let current = call.parent;
+    let implied = true;
+    while (current !== null) {
+      if (current.type === "unary_expression") {
+        implied = false;
+        break;
+      }
+      if (current.type === "binary_expression") {
+        const left = current.childForFieldName("left");
+        const right = current.childForFieldName("right");
+        const operator = left === null || right === null ? "" : source.slice(left.endIndex, right.startIndex).trim();
+        if (operator !== "&&") {
+          implied = false;
+          break;
+        }
+      }
+      if (sameSyntaxNode(current, condition)) break;
+      current = current.parent;
+    }
+    if (implied) return true;
+  }
+  return false;
+}
+function returnedMetadataDestination(method, body2, destination, after, lexicalSource, source) {
+  for (const statement of descendants(body2, "return_statement")) {
+    if (!sameSyntaxNode(owningFunction(statement), method) || statement.startIndex <= after.endIndex || !reachableWithinBoundary(body2, statement, lexicalSource)) continue;
+    const returnedName = /^return([A-Za-z_]\w*)$/.exec(
+      sourceText(statement, source).replace(/\s+/g, "")
+    )?.[1];
+    if (returnedName === destination) return statement;
+    if (returnedName === void 0) continue;
+    const alias = [
+      ...descendants(body2, "short_var_declaration"),
+      ...descendants(body2, "assignment_statement")
+    ].filter(
+      (candidate) => sameSyntaxNode(owningFunction(candidate), method) && candidate.startIndex > after.endIndex && candidate.endIndex < statement.startIndex
+    ).find((candidate) => {
+      const block = enclosingBlock(candidate);
+      if (block === null || !containsNode(block, statement) || !directlyReachableInBlock(block, candidate, lexicalSource)) return false;
+      return simpleBindingPairs(candidate, source).some(
+        (pair) => pair.name === returnedName && pathEquals(selectorPath(pair.right, source), [destination])
+      );
+    });
+    if (alias !== void 0 && bindingPathPreserved(method, destination, alias, source, after.endIndex) && bindingPathPreserved(method, returnedName, statement, source, alias.endIndex)) return statement;
+  }
+  return void 0;
 }
 function cancelledResponsePublicationSignals(file, root, previousRoot) {
   const httpAliases = standardImportAliases(root, file.current, "net/http", "http");
@@ -24439,7 +24751,7 @@ function addPositives(ctx, analysis) {
 function createApp() {
   const app = new Adversary({
     name: domain.name,
-    version: "0.0.20",
+    version: "0.0.21",
     review: { maximumFindings: 5, minimumConfidence: "medium" }
   });
   app.rule(`${domain.name}.review`, async (ctx) => {
