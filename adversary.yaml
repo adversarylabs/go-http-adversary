@@ -1,4 +1,4 @@
-name: go/http
+name: adversarylabs/go/http
 version: 0.0.21
 description: Reviews Go HTTP services for bounded requests, safe middleware, and production-ready server lifecycle.
 
