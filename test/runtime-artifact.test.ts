@@ -111,7 +111,7 @@ func (w *errorResponseWrapper) ResponseTrailer() http.Header {
   const envelope = JSON.parse(await readFile(output, "utf8"));
   assert.equal(envelope.protocolVersion, 1);
   assert.equal(envelope.result.adversary.name, "go-http");
-  assert.equal(envelope.result.adversary.version, "0.0.21");
+  assert.equal(envelope.result.adversary.version, "0.0.22");
   assert.equal(
     envelope.result.findings.some((finding: { ruleId?: string }) =>
       finding.ruleId === "go-http.cancelled-response-publication"
