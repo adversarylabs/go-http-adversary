@@ -92,12 +92,15 @@ function changedContext(repoPath: string, changedFiles: string[]): RuleContext {
     headRef: "WORKTREE",
     scanMode: "changed",
     changedFiles,
+    changedRanges: [],
     worktree: true,
   };
   return {
     repoPath,
     change,
     repoIndex: null,
+    repoGraph: null,
+    outcomeContext: null,
     summary: {},
     cache: new Map(),
     relpath: (path) => path,
